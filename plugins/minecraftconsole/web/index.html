@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>minecraftconsole - MC 控制台</title>
+  <style>
+    :root {
+      --sidebar-width: 220px;
+      --brand-gradient: linear-gradient(135deg, #6366f1, #38bdf8);
+      --accent: #6366f1;
+      --bg: #07080d;
+      --sidebar-bg: #0b0d14;
+      --overlay-bg: #10131d;
+      --text-primary: #e8ebf4;
+      --text-regular: #c8cddd;
+      --text-secondary: #8b93ad;
+      --border: #1c2133;
+      --fill: #10131d;
+      --fill-light: #12151f;
+      --primary: #6366f1;
+      --primary-light-3: #818cf8;
+      --primary-light-9: #1b1f3d;
+      --success: #10b981;
+      --danger: #ef4444;
+    }
+
+    html.light {
+      --bg: #f5f7fa;
+      --sidebar-bg: #ffffff;
+      --overlay-bg: #ffffff;
+      --text-primary: #1f2937;
+      --text-regular: #374151;
+      --text-secondary: #6b7280;
+      --border: #e5e7eb;
+      --fill: #f9fafb;
+      --fill-light: #fafafa;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      background: var(--bg);
+      color: var(--text-primary);
+      transition: background-color .3s ease, color .3s ease;
+    }
+
+    /* 布局 */
+    .app { display: flex; height: 100vh; }
+    .sidebar {
+      width: var(--sidebar-width);
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      transition: width .2s;
+      overflow: hidden;
+    }
+    .sidebar.collapsed { width: 64px; }
+
+    .brand {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 700;
+    }
+    .brand-logo {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: var(--brand-gradient);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 18px;
+    }
+    .brand-name {
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: .02em;
+      background: var(--brand-gradient);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .sidebar.collapsed .brand-name { display: none; }
+
+    .nav { flex: 1; overflow-y: auto; padding: 8px 0; }
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      cursor: pointer;
+      color: var(--text-regular);
+      font-size: 14px;
+      transition: background-color .2s, color .2s;
+      border-radius: 6px;
+      margin: 2px 8px;
+    }
+    .nav-item:hover { background: var(--fill-light); color: var(--text-primary); }
+    .nav-item.active { background: var(--primary-light-9); color: var(--primary-light-3); }
+    .nav-item .icon { width: 20px; text-align: center; font-size: 16px; }
+    .sidebar.collapsed .nav-item span { display: none; }
+    .sidebar.collapsed .nav-item { justify-content: center; padding: 10px; }
+
+    .sidebar-foot { border-top: 1px solid var(--border); padding: 8px 0; }
+    .sidebar-version { text-align: center; color: var(--text-secondary); font-size: 12px; padding: 6px 0; }
+    .sidebar.collapsed .sidebar-version { display: none; }
+
+    /* 右侧主区 */
+    .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .topbar {
+      height: 52px;
+      background: var(--sidebar-bg);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 12px; }
+    .topbar-right { display: flex; align-items: center; gap: 12px; }
+
+    .btn-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      color: var(--text-regular);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      transition: all .2s;
+    }
+    .btn-icon:hover { background: var(--fill-light); color: var(--primary); }
+
+    .page-title { font-size: 16px; font-weight: 600; }
+
+    .user-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      padding: 6px 10px;
+      border-radius: 6px;
+      transition: background .2s;
+    }
+    .user-chip:hover { background: var(--fill-light); }
+    .user-tag {
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--primary-light-9);
+      color: var(--primary-light-3);
+    }
+
+    .content { flex: 1; overflow: auto; padding: 0; }
+    .page { display: none; height: 100%; }
+    .page.active { display: block; }
+
+    /* 控制台页 */
+    .console-page { padding: 16px; }
+    .status-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 16px; }
+    .stat-card {
+      background: var(--overlay-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      transition: transform .25s ease, box-shadow .25s ease;
+    }
+    .stat-card:hover { transform: translateY(-3px); box-shadow: 0 12px 32px -8px rgba(99, 102, 241, .18); }
+    .stat-label { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; }
+    .stat-value { font-size: 26px; font-weight: 700; line-height: 1.2; }
+    .stat-value.online { color: var(--success); }
+    .stat-value.offline { color: var(--danger); }
+
+    .section { background: var(--overlay-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .section-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
+
+    .quick-cmds { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btn-cmd {
+      padding: 6px 12px;
+      background: var(--fill-light);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-regular);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .btn-cmd:hover { background: var(--primary-light-9); color: var(--primary-light-3); border-color: var(--primary); }
+
+    .cmd-input-box { display: flex; gap: 8px; }
+    .cmd-input {
+      flex: 1;
+      background: var(--fill);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color .2s;
+    }
+    .cmd-input:focus { border-color: var(--primary); }
+    .btn-send {
+      padding: 8px 16px;
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: opacity .2s;
+    }
+    .btn-send:hover { opacity: .9; }
+    .btn-send:disabled { opacity: .5; cursor: not-allowed; }
+
+    .log-box {
+      background: var(--fill);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      height: calc(100vh - 380px);
+      overflow: auto;
+      font-family: Consolas, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-line { margin-bottom: 2px; }
+    .log-time { color: var(--text-secondary); }
+    .log-sys { color: var(--primary-light-3); }
+    .log-conn { color: #7dd3fc; }
+    .log-admin { color: #fbbf24; }
+    .log-mc { color: #10b981; }
+
+    /* 工作流页 */
+    .workflow-page { padding: 16px; }
+    .wf-toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
+    .btn {
+      padding: 8px 16px;
+      background: var(--fill-light);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-regular);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .btn:hover { background: var(--primary-light-9); color: var(--primary-light-3); }
+    .btn-primary-solid { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .btn-primary-solid:hover { opacity: .9; }
+
+    .wf-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+    .wf-card {
+      background: var(--overlay-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      cursor: pointer;
+      transition: all .25s;
+    }
+    .wf-card:hover { transform: translateY(-3px); box-shadow: 0 12px 32px -8px rgba(99, 102, 241, .18); border-color: var(--primary); }
+    .wf-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .wf-card-title { font-size: 15px; font-weight: 600; }
+    .wf-card-status { font-size: 11px; padding: 2px 8px; border-radius: 4px; }
+    .wf-card-status.enabled { background: rgba(16, 185, 129, .15); color: var(--success); }
+    .wf-card-status.disabled { background: rgba(107, 114, 128, .15); color: var(--text-secondary); }
+    .wf-card-desc { font-size: 12px; color: var(--text-secondary); }
+
+    /* 文件管理页 */
+    .files-page { padding: 16px; display: flex; flex-direction: column; height: 100%; }
+    .files-toolbar { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; }
+    .files-path {
+      flex: 1;
+      background: var(--fill);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: var(--text-primary);
+      font-size: 13px;
+      font-family: Consolas, Menlo, monospace;
+    }
+    .files-list {
+      flex: 1;
+      background: var(--overlay-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: auto;
+    }
+    .file-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background .2s;
+    }
+    .file-item:hover { background: var(--fill-light); }
+    .file-item:last-child { border-bottom: none; }
+    .file-icon { font-size: 18px; width: 24px; text-align: center; }
+    .file-name { flex: 1; font-size: 14px; }
+    .file-size { font-size: 12px; color: var(--text-secondary); }
+
+    /* 滚动条 */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--primary-light-3); }
+    ::-webkit-scrollbar-track { background: transparent; }
+
+    /* 响应式 */
+    @media (max-width: 768px) {
+      .sidebar { position: absolute; z-index: 100; height: 100%; transform: translateX(-100%); }
+      .sidebar.show { transform: translateX(0); }
+      .status-cards { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div id="app" class="app">
+  <aside id="sidebar" class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">⛏</div>
+      <span class="brand-name">minecraftconsole</span>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active" data-page="console">
+        <span class="icon">📡</span>
+        <span>MC 控制台</span>
+      </div>
+      <div class="nav-item" data-page="workflow">
+        <span class="icon">🔀</span>
+        <span>工作流</span>
+      </div>
+      <div class="nav-item" data-page="files">
+        <span class="icon">📁</span>
+        <span>文件管理</span>
+      </div>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="sidebar-version">v1.0.0</div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button id="toggleSidebar" class="btn-icon" title="折叠侧边栏">☰</button>
+        <span id="pageTitle" class="page-title">MC 控制台</span>
+      </div>
+      <div class="topbar-right">
+        <button id="toggleTheme" class="btn-icon" title="切换主题">🌙</button>
+        <div class="user-chip">
+          <span>👤</span>
+          <span id="username">admin</span>
+          <span class="user-tag">超管</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="content">
+      <!-- MC 控制台 -->
+      <div id="consolePage" class="page active">
+        <div class="console-page">
+          <div class="status-cards">
+            <div class="stat-card">
+              <div class="stat-label">服务器状态</div>
+              <div id="statusOnline" class="stat-value offline">离线</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">TPS</div>
+              <div id="statusTps" class="stat-value">0.00</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">在线玩家</div>
+              <div id="statusPlayers" class="stat-value">0</div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">快捷命令</div>
+            <div class="quick-cmds">
+              <button class="btn-cmd" data-cmd="list">/list</button>
+              <button class="btn-cmd" data-cmd="tps">/tps</button>
+              <button class="btn-cmd" data-cmd="say ">/say</button>
+              <button class="btn-cmd" data-cmd="give @a command_block">/give</button>
+              <button class="btn-cmd" data-cmd="op ">/op</button>
+              <button class="btn-cmd" data-cmd="deop ">/deop</button>
+              <button class="btn-cmd" data-cmd="gamemode ">/gamemode</button>
+              <button class="btn-cmd" data-cmd="kill ">/kill</button>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">命令输入</div>
+            <div class="cmd-input-box">
+              <input type="text" id="cmdInput" class="cmd-input" placeholder="输入 MC 命令，如 give @a command_block（无需开头的 /）">
+              <button id="sendCmdBtn" class="btn-send">发送</button>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-title">实时日志</div>
+            <div id="logBox" class="log-box"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 工作流 -->
+      <div id="workflowPage" class="page">
+        <div class="workflow-page">
+          <div class="wf-toolbar">
+            <button id="newWfBtn" class="btn btn-primary-solid">+ 新建工作流</button>
+            <button id="refreshWfBtn" class="btn">刷新</button>
+          </div>
+          <div id="wfList" class="wf-list"></div>
+        </div>
+      </div>
+
+      <!-- 文件管理 -->
+      <div id="filesPage" class="page">
+        <div class="files-page">
+          <div class="files-toolbar">
+            <button id="filesBackBtn" class="btn">⬆ 上级</button>
+            <input type="text" id="filesPath" class="files-path" value="/" readonly>
+            <button id="filesRefreshBtn" class="btn">刷新</button>
+          </div>
+          <div id="filesList" class="files-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 文件查看浮层 -->
+<style>
+  .file-viewer-mask {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,.55);
+    display: none; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .file-viewer-box {
+    background: var(--overlay-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: 100%; max-width: 860px;
+    height: 76vh;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .file-viewer-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-regular); font-size: 13px;
+  }
+  .file-viewer-path { font-family: Consolas, Menlo, monospace; color: var(--text-primary); word-break: break-all; }
+  .file-viewer-pre {
+    flex: 1; overflow: auto; margin: 0; padding: 12px 14px;
+    background: var(--fill);
+    color: var(--text-primary);
+    font-family: Consolas, Menlo, monospace;
+    font-size: 12.5px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-all;
+  }
+</style>
+<div id="fileViewer" class="file-viewer-mask">
+  <div class="file-viewer-box">
+    <div class="file-viewer-head">
+      <span>📄 <span class="file-viewer-path" id="fileViewerPath"></span></span>
+      <button id="fileViewerClose" class="btn sm">关闭</button>
+    </div>
+    <pre id="fileContent" class="file-viewer-pre"></pre>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // 状态
+  const state = {
+    theme: localStorage.getItem('mc_theme') || 'dark',
+    currentPage: 'console',
+    statusTimer: null,
+    sseSource: null,
+    workflows: [],
+    filesPath: '/',
+  };
+
+  // DOM
+  const $ = (sel) => document.querySelector(sel);
+  const $$ = (sel) => document.querySelectorAll(sel);
+
+  // 状态轮询
+  async function loadStatus() {
+    try {
+      const resp = await fetch('http://localhost:25598/api/status');
+      const data = await resp.json();
+      if (data.ok) {
+        const s = data.data;
+        $('#statusOnline').textContent = s.online ? '在线' : '离线';
+        $('#statusOnline').className = 'stat-value ' + (s.online ? 'online' : 'offline');
+        $('#statusTps').textContent = s.tps.toFixed(2);
+        $('#statusPlayers').textContent = s.players;
+      }
+    } catch (e) {
+      console.error('加载状态失败:', e);
+    }
+  }
+
+  function startStatusPolling() {
+    loadStatus();
+    state.statusTimer = setInterval(loadStatus, 3000);
+  }
+
+  // SSE 日志流
+  function connectSSE() {
+    const url = 'http://localhost:25598/api/stream';
+    const es = new EventSource(url);
+    es.onmessage = (e) => {
+      appendLog(e.data);
+    };
+    es.onerror = () => {
+      setTimeout(connectSSE, 3000);
+    };
+    state.sseSource = es;
+  }
+
+  function appendLog(line) {
+    const box = $('#logBox');
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    const time = new Date().toLocaleTimeString();
+    let cls = '';
+    if (line.startsWith('[sys]')) cls = 'log-sys';
+    else if (line.startsWith('[conn]')) cls = 'log-conn';
+    else if (line.startsWith('[admin')) cls = 'log-admin';
+    else if (line.startsWith('[mc') || line.startsWith('[MC]')) cls = 'log-mc';
+    div.innerHTML = `<span class="log-time">[${time}]</span> <span class="${cls}">${escapeHtml(line)}</span>`;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+    while (box.childElementCount > 500) box.removeChild(box.firstChild);
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  // 发送命令
+  async function sendCommand(cmd) {
+    if (!cmd.trim()) return;
+    $('#sendCmdBtn').disabled = true;
+    try {
+      const resp = await fetch('http://localhost:25598/api/cmd', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: cmd })
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        appendLog(`[admin:0] /${cmd}`);
+      } else {
+        appendLog(`[error] ${data.error || '发送失败'}`);
+      }
+    } catch (e) {
+      appendLog(`[error] 请求失败`);
+    } finally {
+      $('#sendCmdBtn').disabled = false;
+      $('#cmdInput').value = '';
+    }
+  }
+
+  // 工作流
+  async function loadWorkflows() {
+    try {
+      const resp = await fetch('/api/mc/workflow');
+      const data = await resp.json();
+      if (data.code === 0) {
+        state.workflows = data.data || [];
+        renderWorkflows();
+      }
+    } catch (e) {
+      console.error('加载工作流失败:', e);
+    }
+  }
+
+  function renderWorkflows() {
+    const list = $('#wfList');
+    if (state.workflows.length === 0) {
+      list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-secondary);">暂无工作流</div>';
+      return;
+    }
+    list.innerHTML = state.workflows.map(wf => `
+      <div class="wf-card" data-id="${wf.id}">
+        <div class="wf-card-header">
+          <div class="wf-card-title">${escapeHtml(wf.name || wf.id)}</div>
+          <div class="wf-card-status ${wf.enabled ? 'enabled' : 'disabled'}">${wf.enabled ? '启用' : '禁用'}</div>
+        </div>
+        <div class="wf-card-desc">${escapeHtml(wf.desc || '无描述')}</div>
+      </div>
+    `).join('');
+  }
+
+  // 文件管理
+  async function loadFiles(path) {
+    state.filesPath = (path || '').replace(/^\/+/, '');
+    $('#filesPath').value = state.filesPath ? state.filesPath : '/';
+    try {
+      const rel = state.filesPath.replace(/^\/+/, '') || '.';
+      const resp = await fetch('/api/mc/fs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ op: 'list', path: rel })
+      });
+      const data = await resp.json();
+      if (data.code === 0) {
+        const t = String((data.data && data.data.output) || '');
+        if (/^FS 参数错误|^不是目录|^无法/.test(t)) {
+          $('#filesList').innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger,#ef4444);font-size:13px;">' + escapeHtml(t) + '</div>';
+          return;
+        }
+        renderFiles(parseFileList(data.data, state.filesPath));
+      } else if (data.code !== 401) {
+        $('#filesList').innerHTML = '<div style="text-align:center;padding:40px;color:var(--danger,#ef4444);font-size:13px;">' + escapeHtml(data.msg || '加载失败') + '</div>';
+      }
+    } catch (e) {
+      console.error('加载文件列表失败:', e);
+    }
+  }
+
+  // agent FS|LIST 输出：每行 "F|D\t大小\tMM-dd HH:mm\t文件名"，转成结构化条目
+  function parseFileList(out, dir) {
+    if (Array.isArray(out)) return out;
+    if (!out || typeof out.output !== 'string') return [];
+    const base = String(dir || '/').replace(/\/+$/, '') || '';
+    const rows = [];
+    out.output.split('\n').forEach((line) => {
+      line = line.replace(/\r$/, '');
+      if (!line.trim()) return;
+      const parts = line.split('\t');
+      if (parts.length < 4) return;
+      rows.push({
+        name: parts[3],
+        is_dir: parts[0] === 'D',
+        size: parseInt(parts[1], 10) || 0,
+        path: base + '/' + parts[3],
+      });
+    });
+    return rows;
+  }
+
+  // 查看文件内容（FS|READ）
+  async function viewFile(path) {
+    $('#fileViewerPath').textContent = path;
+    $('#fileContent').textContent = '加载中…';
+    $('#fileViewer').style.display = 'flex';
+    try {
+      const rel = String(path).replace(/^\/+/, '') || '.';
+      const resp = await fetch('/api/mc/fs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ op: 'read', path: rel, maxBytes: 262144 })
+      });
+      const data = await resp.json();
+      if (data.code === 0) {
+        const out = String(((data.data && data.data.output) || '')).replace(/^----- .+ -----\r?\n?/, '');
+        $('#fileContent').textContent = (out.length > 262144 ? out.slice(0, 262144) + '\n…（截断）' : out) || '（空文件）';
+      } else {
+        $('#fileContent').textContent = '读取失败: ' + (data.msg || '未知错误');
+      }
+    } catch (e) {
+      $('#fileContent').textContent = '请求失败: ' + e.message;
+    }
+  }
+
+  function closeFileViewer() {
+    $('#fileViewer').style.display = 'none';
+  }
+
+  function renderFiles(files) {
+    const list = $('#filesList');
+    if (files.length === 0) {
+      list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-secondary);">空目录</div>';
+      return;
+    }
+    list.innerHTML = files.map(f => `
+      <div class="file-item" data-path="${escapeHtml(f.path)}" data-is-dir="${f.is_dir}">
+        <div class="file-icon">${f.is_dir ? '📁' : '📄'}</div>
+        <div class="file-name">${escapeHtml(f.name)}</div>
+        <div class="file-size">${f.is_dir ? '' : formatSize(f.size)}</div>
+      </div>
+    `).join('');
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
+  // 页面切换
+  function switchPage(page) {
+    state.currentPage = page;
+    $$('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.page === page));
+    $$('.page').forEach(el => el.classList.toggle('active', el.id === page + 'Page'));
+    const titles = { console: 'MC 控制台', workflow: '工作流', files: '文件管理' };
+    $('#pageTitle').textContent = titles[page] || '';
+    if (page === 'workflow') loadWorkflows();
+    if (page === 'files') loadFiles(state.filesPath);
+  }
+
+  // 主题切换
+  function toggleTheme() {
+    state.theme = state.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.className = state.theme === 'light' ? 'light' : '';
+    localStorage.setItem('mc_theme', state.theme);
+    $('#toggleTheme').textContent = state.theme === 'dark' ? '🌙' : '☀️';
+  }
+
+  // 事件绑定
+  function bindEvents() {
+    $('#toggleSidebar').addEventListener('click', () => $('#sidebar').classList.toggle('collapsed'));
+    $('#toggleTheme').addEventListener('click', toggleTheme);
+
+    $$('.nav-item').forEach(el => {
+      el.addEventListener('click', () => switchPage(el.dataset.page));
+    });
+
+    $('#sendCmdBtn').addEventListener('click', () => sendCommand($('#cmdInput').value));
+    $('#cmdInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') sendCommand($('#cmdInput').value); });
+
+    $$('.btn-cmd').forEach(el => {
+      el.addEventListener('click', () => {
+        const cmd = el.dataset.cmd;
+        if (cmd.endsWith(' ')) {
+          $('#cmdInput').value = cmd;
+          $('#cmdInput').focus();
+        } else {
+          sendCommand(cmd);
+        }
+      });
+    });
+
+    $('#refreshWfBtn').addEventListener('click', loadWorkflows);
+    $('#newWfBtn').addEventListener('click', openWorkflowEditor);
+
+    $('#filesRefreshBtn').addEventListener('click', () => loadFiles(state.filesPath));
+    $('#filesBackBtn').addEventListener('click', () => {
+      const parts = state.filesPath.split('/').filter(Boolean);
+      parts.pop();
+      loadFiles('/' + parts.join('/') || '/');
+    });
+
+    $('#filesList').addEventListener('click', (e) => {
+      const item = e.target.closest('.file-item');
+      if (!item) return;
+      const path = item.dataset.path;
+      const isDir = item.dataset.isDir === 'true';
+      if (isDir) loadFiles(path);
+      else viewFile(path);
+    });
+
+    $('#fileViewerClose').addEventListener('click', closeFileViewer);
+    $('#fileViewer').addEventListener('click', (e) => {
+      if (e.target === $('#fileViewer')) closeFileViewer();
+    });
+  }
+
+  // 打开工作流编辑器（若本页以框架面板 iframe 挂载，则切到同面板的 workflow.html 入口）
+  function openWorkflowEditor() {
+    if (location.pathname.indexOf('/index.html') >= 0) {
+      location.href = 'workflow.html';
+      return;
+    }
+    const q = new URLSearchParams(location.search);
+    q.set('entry', 'workflow.html');
+    location.href = location.pathname + '?' + q.toString();
+  }
+
+  // 初始化
+  function init() {
+    document.documentElement.className = state.theme === 'light' ? 'light' : '';
+    $('#toggleTheme').textContent = state.theme === 'dark' ? '🌙' : '☀️';
+    bindEvents();
+    startStatusPolling();
+    connectSSE();
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

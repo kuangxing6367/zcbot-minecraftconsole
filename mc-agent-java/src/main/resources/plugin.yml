@@ -1,0 +1,7 @@
+# mc-agent 服务器侧插件
+name: mc-agent
+version: 1.0.0
+main: com.zgric.mcagent.MCAgent
+api-version: 1.12
+author: ZGRIC
+description: minecraftconsole 服务器侧 agent（心跳上报 + 远程命令执行）

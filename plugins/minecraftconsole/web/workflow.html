@@ -1,0 +1,1650 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>minecraftconsole · 控制台</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
+<style>
+  /* ============================================================
+     设计系统 · Design Tokens（深色专业工作台）
+     ============================================================ */
+  :root{
+    /* 背景 / 表面层级 */
+    --bg-deep:#07080d;
+    --bg:#0a0c13;
+    --surface:#11141f;        /* 面板 */
+    --surface-2:#161a28;      /* 内嵌 / 输入框 */
+    --surface-3:#1d2231;      /* hover 层 */
+    --border:#232a3d;
+    --border-strong:#303955;
+
+    /* 文本层级 */
+    --text:#e7eaf5;           /* 主文本 */
+    --text-2:#9aa3bf;         /* 次级文本 */
+    --text-3:#5f6782;         /* 弱化 / 标签 */
+
+    /* 品牌色：靛蓝主色 + 青蓝辅助 */
+    --accent:#6366f1;
+    --accent-hi:#818cf8;
+    --accent-soft:rgba(99,102,241,.16);
+    --cyan:#22d3ee;
+    --cyan-soft:rgba(34,211,238,.14);
+
+    /* 语义色 */
+    --ok:#34d399;
+    --ok-soft:rgba(52,211,153,.14);
+    --warn:#fbbf24;
+    --warn-soft:rgba(251,191,36,.14);
+    --danger:#f87171;
+    --danger-soft:rgba(248,113,113,.14);
+
+    /* 圆角 / 阴影 / 字号（4/8 间距体系） */
+    --r-sm:8px; --r-md:10px; --r-lg:14px;
+    --shadow-1:0 1px 2px rgba(0,0,0,.35),0 4px 12px rgba(0,0,0,.22);
+    --shadow-2:0 4px 10px rgba(0,0,0,.4),0 16px 36px rgba(0,0,0,.32);
+    --fs-xs:11px; --fs-sm:12px; --fs-md:13px; --fs-lg:15px;
+
+    --sans:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    --mono:ui-monospace,"Cascadia Code",Consolas,Menlo,monospace;
+  }
+
+  *{margin:0;padding:0;box-sizing:border-box}
+  [v-cloak]{display:none}
+  html,body{height:100%;overflow:hidden}
+  body{font-family:var(--sans);font-size:var(--fs-md);line-height:1.55;color:var(--text-2);
+    background:var(--bg-deep);-webkit-font-smoothing:antialiased}
+  button{font-family:inherit}
+  input,select,textarea{font-family:inherit}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--surface-3);border-radius:8px;border:2px solid var(--bg-deep)}
+  ::-webkit-scrollbar-track{background:transparent}
+  .root{height:100%}
+
+  /* ============================================================
+     主布局（顶栏 + 左侧导航 + 内容区）
+     ============================================================ */
+  .layout-root{display:flex;flex-direction:column;height:100vh;overflow:hidden;
+    background:
+      radial-gradient(ellipse 60% 45% at 12% -8%,rgba(99,102,241,.12),transparent 60%),
+      radial-gradient(ellipse 50% 40% at 95% 110%,rgba(34,211,238,.07),transparent 60%),
+      var(--bg-deep)}
+  .topbar{display:flex;align-items:center;gap:16px;margin:14px 16px 0;padding:10px 14px;
+    background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);
+    flex-shrink:0}
+  .brand{display:flex;align-items:center;gap:11px;padding-right:16px;border-right:1px solid var(--border)}
+  .brand-mark{width:34px;height:34px;border-radius:10px;flex-shrink:0;display:grid;place-items:center;
+    background:linear-gradient(140deg,#6366f1,#4338ca);color:#fff;
+    box-shadow:0 4px 14px rgba(99,102,241,.4)}
+  .brand-text{display:flex;flex-direction:column;line-height:1.25}
+  .brand-title{font-size:var(--fs-lg);font-weight:800;color:var(--text);letter-spacing:-.01em}
+  .brand-sub{font-size:var(--fs-xs);color:var(--text-3);font-family:var(--mono);letter-spacing:.04em}
+  .spacer{flex:1}
+
+  .user-chip{display:flex;align-items:center;gap:9px;padding:4px 12px 4px 5px;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:999px}
+  .user-avatar{width:27px;height:27px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;
+    background:linear-gradient(140deg,#6366f1,#4338ca);color:#fff;font-size:var(--fs-sm);font-weight:800}
+  .user-meta{display:flex;flex-direction:column;line-height:1.25}
+  .user-name{font-size:var(--fs-sm);font-weight:700;color:var(--text);max-width:140px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .user-role{font-size:var(--fs-xs);color:var(--text-3)}
+
+  .layout-body{display:flex;flex:1;min-height:0;gap:12px;padding:12px 16px 14px}
+  .side-nav{width:172px;flex-shrink:0;display:flex;flex-direction:column;gap:6px;
+    background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);
+    padding:10px}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--r-md);
+    color:var(--text-2);font-size:var(--fs-md);font-weight:600;text-decoration:none;
+    border:1px solid transparent;transition:all .15s;cursor:pointer}
+  .nav-item:hover{background:var(--surface-2);color:var(--text)}
+  .nav-item.nav-active{background:var(--accent-soft);border-color:rgba(99,102,241,.45);color:var(--text)}
+  .nav-ico{display:grid;place-items:center;color:var(--accent-hi);flex-shrink:0}
+  .view-host{flex:1;min-width:0;min-height:0;display:flex}
+
+  /* 各视图根容器 */
+  .wf-view,.files-view{display:flex;flex-direction:column;gap:12px;flex:1;min-width:0;min-height:0}
+
+  /* ============================================================
+     登录页
+     ============================================================ */
+  .login-page{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+    background:
+      radial-gradient(ellipse 60% 45% at 12% -8%,rgba(99,102,241,.18),transparent 60%),
+      radial-gradient(ellipse 50% 40% at 95% 110%,rgba(34,211,238,.1),transparent 60%),
+      var(--bg-deep)}
+  .login-card{width:390px;max-width:100%;background:var(--surface);border:1px solid var(--border-strong);
+    border-radius:18px;padding:34px 32px 28px;box-shadow:var(--shadow-2)}
+  .login-brand{display:flex;align-items:center;gap:12px;margin-bottom:26px;padding-bottom:18px;
+    border-bottom:1px solid var(--border)}
+  .login-brand .brand-mark{width:42px;height:42px;border-radius:12px}
+  .login-hint{font-size:var(--fs-xs);color:var(--text-3);font-family:var(--mono);line-height:1.8;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);
+    padding:8px 12px;margin-bottom:14px}
+
+  /* ============================================================
+     通用控件
+     ============================================================ */
+  .wf-name-box{display:flex;align-items:center;gap:8px}
+  .wf-name-box>span{font-size:var(--fs-sm);color:var(--text-3);font-weight:600;white-space:nowrap}
+  .wf-name-box input{width:210px;background:var(--surface-2);border:1px solid var(--border-strong);
+    color:var(--text);border-radius:var(--r-sm);padding:7px 11px;font-size:var(--fs-md);font-weight:600;
+    transition:border-color .15s,box-shadow .15s}
+  .wf-name-box input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .wf-name-box input:disabled{opacity:.45;cursor:not-allowed}
+
+  /* 开关（switch） */
+  .sw-label{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:999px;padding:5px 12px}
+  .sw-label input{position:absolute;opacity:0;width:0;height:0}
+  .sw-track{position:relative;width:32px;height:18px;border-radius:999px;background:var(--surface-3);
+    transition:background .2s;flex-shrink:0}
+  .sw-track::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+    background:#7b84a3;transition:all .2s}
+  .sw-label input:checked + .sw-track{background:var(--ok-soft)}
+  .sw-label input:checked + .sw-track::after{transform:translateX(14px);background:var(--ok);
+    box-shadow:0 0 8px rgba(52,211,153,.55)}
+  .sw-label input:focus-visible + .sw-track{outline:2px solid var(--accent-hi);outline-offset:2px}
+  .sw-text{font-size:var(--fs-sm);font-weight:600;color:var(--text-2)}
+
+  /* 执行后发送设置 */
+  .sendbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:8px 16px;
+    background:linear-gradient(90deg,rgba(99,102,241,.06),transparent);
+    border-bottom:1px solid var(--border);font-size:var(--fs-sm)}
+  .sendbar-label{font-weight:700;color:var(--text-2);white-space:nowrap}
+  .sendcfg{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-sm);color:var(--text-2);
+    user-select:none;flex-wrap:wrap;white-space:nowrap}
+  .sendcfg input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px;cursor:pointer}
+  .sendcfg select,.sendcfg input[type=text]{background:var(--surface-2);color:var(--text);
+    border:1px solid var(--border-strong);border-radius:var(--r-sm);padding:5px 8px;font-size:var(--fs-sm)}
+  .sendcfg select:focus,.sendcfg input[type=text]:focus{outline:none;border-color:var(--accent)}
+
+  /* 按钮 */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;cursor:pointer;
+    border:none;border-radius:var(--r-sm);padding:8px 14px;font-size:var(--fs-md);font-weight:600;
+    transition:all .16s;white-space:nowrap}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary:hover:not(:disabled){background:#585bf0;box-shadow:0 6px 18px rgba(99,102,241,.42)}
+  .btn-ghost{background:transparent;color:var(--text-2);border:1px solid var(--border-strong)}
+  .btn-ghost:hover:not(:disabled){border-color:var(--accent);color:var(--text)}
+  .btn-success{background:var(--ok-soft);color:var(--ok);border:1px solid rgba(52,211,153,.32)}
+  .btn-success:hover:not(:disabled){background:rgba(52,211,153,.22)}
+  .btn-danger{background:var(--danger-soft);color:var(--danger);border:1px solid rgba(248,113,113,.32)}
+  .btn-danger:hover:not(:disabled){background:rgba(248,113,113,.22)}
+  .btn-sm{padding:5px 10px;font-size:var(--fs-sm);border-radius:7px}
+  .btn-block{width:100%}
+  .spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
+    border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+  .btn-success .spinner,.btn-danger .spinner,.btn-ghost .spinner{border-color:rgba(255,255,255,.18);border-top-color:currentColor}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* 表单字段 */
+  .field{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+  .field label{font-size:var(--fs-sm);color:var(--text-3);font-weight:600}
+  .field input[type=text],.field input[type=password],.field select,.field textarea{width:100%;
+    background:var(--surface-2);border:1px solid var(--border-strong);color:var(--text);
+    border-radius:var(--r-sm);padding:9px 11px;font-size:var(--fs-md);
+    transition:border-color .15s,box-shadow .15s}
+  .field textarea{font-family:var(--mono);font-size:var(--fs-sm);line-height:1.6;
+    min-height:66px;resize:vertical}
+  .field input:focus,.field select:focus,.field textarea:focus{outline:none;
+    border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .field select{cursor:pointer}
+  .field .chk{display:flex;align-items:center;gap:9px;font-size:var(--fs-md);color:var(--text);
+    cursor:pointer;user-select:none}
+  .field .chk input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer}
+
+  .msg{font-size:var(--fs-sm);line-height:1.6;min-height:1.2em;color:var(--text-3)}
+  .msg.ok{color:var(--ok)}.msg.err{color:var(--danger)}
+
+  /* ============================================================
+     测试运行台
+     ============================================================ */
+  .console{background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);
+    overflow:hidden;flex-shrink:0}
+  .console-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);
+    background:var(--surface-2)}
+  .console-bar .c-title{display:flex;align-items:center;gap:8px;font-size:var(--fs-sm);font-weight:700;
+    color:var(--text);letter-spacing:.04em}
+  .console-bar .c-title svg{color:var(--cyan)}
+  .console-bar .c-hint{font-size:var(--fs-xs);color:var(--text-3);font-family:var(--mono)}
+  .console-bar .c-toggle{margin-left:auto}
+  .console-body{padding:10px 12px 12px;display:flex;flex-direction:column;gap:9px}
+  .run-row{display:flex;gap:9px;align-items:center}
+  .run-row input{flex:1;background:var(--surface-2);border:1px solid var(--border-strong);color:var(--text);
+    border-radius:var(--r-sm);padding:8px 12px;font-family:var(--mono);font-size:var(--fs-sm);
+    transition:border-color .15s,box-shadow .15s}
+  .run-row input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .output{background:#0a0d15;border:1px solid var(--border);border-radius:var(--r-md);
+    padding:10px 13px;font-family:var(--mono);font-size:var(--fs-sm);color:#7ee787;line-height:1.7;
+    white-space:pre-wrap;word-break:break-all;min-height:58px;max-height:148px;overflow-y:auto}
+  .output.idle{color:var(--text-3)}
+
+  /* ============================================================
+     工作流主体三栏
+     ============================================================ */
+  .layout{display:grid;grid-template-columns:236px minmax(0,1fr) 312px;gap:12px;
+    flex:1;min-height:0;align-items:stretch}
+  .panel{background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);
+    display:flex;flex-direction:column;min-height:0}
+  .panel-head{display:flex;align-items:center;gap:8px;padding:12px 14px 10px;flex-shrink:0}
+  .panel-head h2{font-size:var(--fs-sm);font-weight:700;color:var(--text);letter-spacing:.05em}
+  .panel-head .count{font-family:var(--mono);font-size:var(--fs-xs);color:var(--text-3);
+    background:var(--surface-2);border:1px solid var(--border);border-radius:99px;padding:1px 8px}
+  .panel-head .grow{flex:1}
+  .panel-body{padding:0 12px 12px;overflow-y:auto;min-height:0;flex:1}
+
+  /* ---------- 左栏 · 工作流列表 ---------- */
+  .wf-list{display:flex;flex-direction:column;gap:6px}
+  .wf-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid transparent;
+    border-radius:var(--r-md);cursor:pointer;transition:all .15s}
+  .wf-item:hover{background:var(--surface-2);border-color:var(--border)}
+  .wf-item.active{background:var(--accent-soft);border-color:rgba(99,102,241,.45)}
+  .wf-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--text-3)}
+  .wf-item.active .wf-dot,.wf-dot.on{background:var(--ok);box-shadow:0 0 7px rgba(52,211,153,.6)}
+  .wf-meta{flex:1;min-width:0;display:flex;flex-direction:column}
+  .wf-name{font-size:var(--fs-md);font-weight:600;color:var(--text);white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .wf-id{font-size:var(--fs-xs);color:var(--text-3);font-family:var(--mono);white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .wf-del{width:24px;height:24px;border:none;border-radius:7px;background:transparent;color:var(--text-3);
+    cursor:pointer;display:grid;place-items:center;flex-shrink:0;transition:all .15s;opacity:0}
+  .wf-item:hover .wf-del{opacity:1}
+  .wf-del:hover{background:var(--danger-soft);color:var(--danger)}
+  .wf-item .sw-track{width:28px;height:16px}
+  .wf-item .sw-track::after{width:12px;height:12px}
+  .wf-item input:checked + .sw-track::after{transform:translateX(12px)}
+  .list-empty{padding:18px 10px;text-align:center;color:var(--text-3);font-size:var(--fs-sm);line-height:1.8}
+
+  /* ---------- 左栏 · 节点库 ---------- */
+  .lib{flex:1;margin-top:0;border-top:1px solid var(--border);
+    background:linear-gradient(180deg,transparent,rgba(99,102,241,.03))}
+  .lib-list{display:flex;flex-direction:column;gap:8px;padding:0 12px 12px;flex:1;min-height:0;overflow-y:auto}
+  .lib-item{display:flex;align-items:center;gap:10px;padding:9px 10px;cursor:grab;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);
+    transition:all .15s;user-select:none}
+  .lib-item:hover{border-color:var(--accent);background:var(--surface-3);
+    box-shadow:var(--shadow-1);transform:translateY(-1px)}
+  .lib-item:active{cursor:grabbing}
+  .lib-icon{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;flex-shrink:0;
+    background:var(--surface-3)}
+  .lib-meta{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.3}
+  .lib-name{font-size:var(--fs-md);font-weight:600;color:var(--text)}
+  .lib-desc{font-size:var(--fs-xs);color:var(--text-3)}
+  .lib-plus{color:var(--text-3);font-size:14px;font-weight:700;transition:color .15s}
+  .lib-item:hover .lib-plus{color:var(--accent-hi)}
+
+  /* ---------- 中栏 · 画布 ---------- */
+  .canvas-wrap{position:relative;background:var(--surface);border:1px solid var(--border-strong);
+    border-radius:var(--r-lg);overflow:hidden;min-height:440px;height:100%}
+  .canvas{position:absolute;inset:0;z-index:1;touch-action:none;user-select:none;
+    background-image:
+      radial-gradient(circle,rgba(120,130,170,.16) 1px,transparent 1.4px),
+      radial-gradient(circle,rgba(120,130,170,.07) 1px,transparent 1px);
+    background-size:24px 24px,24px 24px;
+    background-position:0 0,12px 12px}
+  .canvas-empty{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:12px;pointer-events:none;text-align:center;
+    padding:0 40px}
+  .canvas-empty .ce-icon{width:64px;height:64px;border-radius:18px;display:grid;place-items:center;
+    color:var(--text-3);background:var(--surface-2);border:1px dashed var(--border-strong)}
+  .canvas-empty .ce-title{font-size:var(--fs-lg);font-weight:700;color:var(--text)}
+  .canvas-empty .ce-tip{font-size:var(--fs-sm);color:var(--text-3);line-height:2}
+  .canvas-empty .ce-kbd{color:var(--text-2)}
+  .canvas-hint{position:absolute;left:12px;bottom:10px;z-index:6;display:flex;align-items:center;gap:12px;
+    font-family:var(--mono);font-size:var(--fs-xs);color:var(--text-3);pointer-events:none}
+  .canvas-stats{position:absolute;right:12px;bottom:10px;z-index:6;font-family:var(--mono);
+    font-size:var(--fs-xs);color:var(--text-3);pointer-events:none}
+  .kbd{font-family:var(--mono);font-size:var(--fs-xs);color:var(--text-2);background:var(--surface-2);
+    border:1px solid var(--border);border-bottom-width:2px;border-radius:5px;padding:1px 6px}
+
+  /* 边（SVG 连线） */
+  .edges{position:absolute;inset:0;z-index:5;pointer-events:none;overflow:visible}
+  .edges .ehit{stroke:transparent;stroke-width:16;pointer-events:stroke;cursor:pointer}
+  .edges .evis{pointer-events:stroke;cursor:pointer;transition:stroke-width .15s}
+  .edges .evis.hot{stroke-width:3.5;filter:drop-shadow(0 0 6px rgba(129,140,248,.85))}
+  .wire{stroke:var(--accent-hi);stroke-width:2;stroke-dasharray:7 5;fill:none;pointer-events:none}
+  .edge-label{paint-order:stroke;stroke:#0a0d15;stroke-width:4px;font-family:var(--mono);
+    font-weight:700;font-size:11px;pointer-events:none}
+
+  /* 节点卡片 */
+  .node{position:absolute;top:0;left:0;width:180px;height:76px;z-index:10;cursor:grab;
+    background:linear-gradient(180deg,var(--surface-2),var(--surface));
+    border:1px solid var(--border-strong);border-radius:12px;box-shadow:var(--shadow-1);
+    transition:box-shadow .18s,border-color .18s;will-change:transform}
+  .node::before{content:'';position:absolute;left:-1px;top:10px;bottom:10px;width:3px;
+    border-radius:0 3px 3px 0;background:var(--c)}
+  .node:hover{box-shadow:var(--shadow-2);border-color:#3c4668}
+  .node.selected{border-color:var(--accent-hi);
+    box-shadow:0 0 0 2px var(--accent-soft),var(--shadow-2)}
+  .node-head{display:flex;align-items:center;gap:8px;padding:10px 12px 5px 14px}
+  .node-icon{display:grid;place-items:center;color:var(--c);flex-shrink:0}
+  .node-title{flex:1;min-width:0;font-size:var(--fs-md);font-weight:700;color:var(--text);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .node-type{font-size:var(--fs-xs);color:var(--c);font-weight:700;letter-spacing:.02em;
+    background:var(--surface-3);border:1px solid var(--border);border-radius:6px;padding:1px 7px;flex-shrink:0}
+  .node-body{font-family:var(--mono);font-size:var(--fs-xs);color:var(--text-2);line-height:1.5;
+    padding:3px 12px 0 14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* 端口 */
+  .port{position:absolute;top:50%;transform:translateY(-50%);width:13px;height:13px;border-radius:50%;
+    background:var(--surface-2);border:2px solid var(--border-strong);z-index:12;transition:all .15s}
+  .port-in{left:-7px}
+  .port-out{right:-7px;border-color:var(--c);cursor:crosshair}
+  .port:hover,.port.live{background:var(--c);border-color:var(--c);
+    box-shadow:0 0 0 3px var(--accent-soft),0 0 10px var(--c)}
+  .port.live{animation:portPulse 1.5s ease-in-out infinite}
+  @keyframes portPulse{0%,100%{box-shadow:0 0 0 0 rgba(99,102,241,.4)}50%{box-shadow:0 0 0 6px rgba(99,102,241,0)}}
+
+  /* ---------- 右栏 · 属性检查器 ---------- */
+  .insp-body{padding:2px 14px 14px}
+  .group-title{display:flex;align-items:center;gap:9px;font-size:var(--fs-xs);font-weight:700;
+    letter-spacing:.1em;color:var(--text-3);margin:14px 0 10px;text-transform:uppercase}
+  .group-title::after{content:'';flex:1;height:1px;background:var(--border)}
+  .group-title .gt-ico{color:var(--accent-hi)}
+  .type-chip{display:inline-flex;align-items:center;gap:7px;padding:3px 10px;border-radius:7px;
+    font-size:var(--fs-sm);font-weight:700;border:1px solid var(--border)}
+  .insp-empty{padding:22px 6px;color:var(--text-3);font-size:var(--fs-sm);line-height:2;text-align:center}
+  .insp-empty .ie-ico{font-size:22px;color:var(--text-3);display:block;margin-bottom:6px}
+  .insp-empty ul{list-style:none;text-align:left;margin:8px 2px 0;padding:10px 12px;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);line-height:1.9}
+  .insp-empty ul li::before{content:'·';color:var(--accent-hi);font-weight:700;margin-right:6px}
+  .node-preview{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);
+    background:var(--surface-2);border-radius:var(--r-md);margin-bottom:2px}
+  .node-preview .np-icon{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;
+    background:var(--surface-3)}
+  .node-preview .np-meta{flex:1;min-width:0;display:flex;flex-direction:column}
+  .node-preview .np-name{font-size:var(--fs-md);font-weight:700;color:var(--text);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .node-preview .np-type{font-size:var(--fs-xs);color:var(--text-3);font-family:var(--mono)}
+
+  /* ============================================================
+     文件管理
+     ============================================================ */
+  .files-toolbar{display:flex;align-items:center;gap:10px;padding:9px 14px;flex-wrap:wrap;
+    background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);
+    flex-shrink:0}
+  .crumbs{display:flex;align-items:center;gap:4px;flex-wrap:wrap;font-size:var(--fs-sm);min-width:0}
+  .crumb-root{color:var(--accent-hi);cursor:pointer;font-weight:700;padding:3px 8px;border-radius:6px;
+    transition:background .12s}
+  .crumb-root:hover{background:var(--accent-soft)}
+  .crumb-sep{color:var(--text-3);user-select:none}
+  .crumb{color:var(--text-2);cursor:pointer;padding:3px 8px;border-radius:6px;transition:all .12s;
+    max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .crumb:hover{background:var(--surface-3);color:var(--text)}
+  .crumb.active{color:var(--text);font-weight:700;background:var(--accent-soft)}
+
+  .files-panel{flex:1;min-height:0;display:flex;flex-direction:column;
+    background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);
+    overflow:hidden}
+  .table-wrap{flex:1;min-height:0;overflow:auto}
+  .file-table{width:100%;border-collapse:collapse}
+  .file-table th{position:sticky;top:0;z-index:2;background:var(--surface-2);color:var(--text-3);
+    font-size:var(--fs-xs);font-weight:700;letter-spacing:.06em;text-align:left;padding:9px 14px;
+    border-bottom:1px solid var(--border)}
+  .file-table td{padding:8px 14px;font-size:var(--fs-md);border-bottom:1px solid rgba(35,42,61,.6)}
+  .file-row{cursor:pointer;transition:background .12s}
+  .file-row:hover{background:var(--surface-2)}
+  .file-name{display:flex;align-items:center;gap:9px;color:var(--text);font-weight:600;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:0}
+  .file-ico{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;flex-shrink:0}
+  .file-ico.dir{color:var(--accent-hi);background:var(--accent-soft)}
+  .file-ico.file{color:var(--cyan);background:var(--cyan-soft)}
+  .file-size{font-family:var(--mono);font-size:var(--fs-sm);color:var(--text-2);white-space:nowrap}
+  .file-time{font-family:var(--mono);font-size:var(--fs-xs);color:var(--text-3);white-space:nowrap}
+
+  .editor-panel{padding:12px 14px 14px;gap:10px}
+  .editor-head{display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--border);
+    flex-shrink:0}
+  .editor-path{font-family:var(--mono);font-size:var(--fs-sm);color:var(--cyan);word-break:break-all}
+  .editor{flex:1;min-height:0;width:100%;background:#0a0d15;border:1px solid var(--border);
+    border-radius:var(--r-md);color:var(--text);font-family:var(--mono);font-size:var(--fs-sm);
+    line-height:1.7;padding:12px 14px;resize:none;white-space:pre;overflow:auto}
+  .editor:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .editor-status{font-size:var(--fs-xs);color:var(--text-3);font-family:var(--mono);flex-shrink:0}
+
+  /* ============================================================
+     Toast
+     ============================================================ */
+  .toasts{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:1000;
+    display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none}
+  .toast{display:flex;align-items:center;gap:9px;padding:9px 16px;border-radius:999px;
+    background:var(--surface-2);border:1px solid var(--border-strong);color:var(--text);
+    font-size:var(--fs-sm);font-weight:600;box-shadow:var(--shadow-2);
+    animation:toastIn .22s cubic-bezier(.2,.8,.3,1)}
+  .toast .t-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .toast.t-ok .t-dot{background:var(--ok);box-shadow:0 0 8px rgba(52,211,153,.7)}
+  .toast.t-err .t-dot{background:var(--danger);box-shadow:0 0 8px rgba(248,113,113,.7)}
+  .toast.t-info .t-dot{background:var(--accent-hi);box-shadow:0 0 8px rgba(129,140,248,.7)}
+  @keyframes toastIn{from{opacity:0;transform:translateY(-8px) scale(.96)}to{opacity:1;transform:none}}
+
+  /* ============================================================
+     窄屏回退
+     ============================================================ */
+  @media(max-width:1120px){
+    body{overflow:auto}
+    .layout-root{height:auto;min-height:100vh;overflow:visible}
+    .layout-body{flex-direction:column}
+    .side-nav{width:100%;flex-direction:row}
+    .layout{grid-template-columns:1fr;align-items:start}
+    .canvas-wrap{height:520px}
+    .col-left,.col-right{max-height:460px}
+    .wf-name-box input{width:150px}
+    .view-host{min-height:0}
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+(function(){
+  'use strict';
+
+  // ============================================================ 会话与 API
+  var TOKEN_KEY = 'zcbot_token';    // 与后端 HttpOnly Cookie 同名，这里存 localStorage 供 Bearer 头
+  var SESSION_KEY = 'mc_session';   // {username, role} 会话缓存
+
+  function getToken(){
+    try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
+  }
+  function clearSession(){
+    try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(SESSION_KEY); } catch (e) {}
+  }
+  function getSession(){
+    try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (e) { return null; }
+  }
+  function setSession(s){
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch (e) {}
+  }
+
+  // 全局 Toast（跨组件共享的响应式状态）
+  var toastState = Vue.reactive({ toasts: [] });
+  function toast(text, type){
+    var id = 't' + Date.now().toString(36) + Math.floor(Math.random() * 1e4);
+    toastState.toasts.push({ id: id, text: text, type: type || 'info' });
+    setTimeout(function(){
+      toastState.toasts = toastState.toasts.filter(function(t){ return t.id !== id; });
+    }, 3400);
+  }
+
+  // 统一 API 封装：注入 Authorization Bearer；401 自动清会话并跳登录页
+  var router = null;   // 下方 createRouter 赋值，api() 闭包引用
+  function api(path, opts){
+    opts = opts || {};
+    opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    var t = getToken();
+    if (t) opts.headers['Authorization'] = 'Bearer ' + t;
+    return fetch(path, opts).then(function(r){
+      return r.json().catch(function(){ return { code: -1, msg: '响应解析失败' }; })
+        .then(function(j){
+          if (r.status === 401 && !(j && j.data && j.data.token)) {
+            clearSession();
+            if (router && router.currentRoute.value.path !== '/login') {
+              router.push('/login');
+            }
+            var err = new Error((j && j.msg) || '未登录或令牌无效');
+            err.code = 401;
+            throw err;
+          }
+          return j;
+        });
+    });
+  }
+
+  // ============================================================ 登录页
+  var LoginView = {
+    data: function(){
+      return { username: '', password: '', busy: false, msg: '', err: false };
+    },
+    template: `
+      <div class="login-page">
+        <form class="login-card" @submit.prevent="doLogin" novalidate>
+          <div class="login-brand">
+            <div class="brand-mark" aria-hidden="true">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="6" r="2.6"/><circle cx="19" cy="18" r="2.6"/><path d="M7.4 10.7l9.3-3.5M7.4 13.3l9.3 3.5"/></svg>
+            </div>
+            <div class="brand-text">
+              <span class="brand-title">minecraftconsole</span>
+              <span class="brand-sub">remote MC 控制台 · 登录</span>
+            </div>
+          </div>
+          <div class="field">
+            <label>用户名</label>
+            <input type="text" v-model="username" autocomplete="username" placeholder="请输入用户名" autofocus>
+          </div>
+          <div class="field">
+            <label>密码</label>
+            <input type="password" v-model="password" autocomplete="current-password" placeholder="请输入密码">
+          </div>
+          <div class="msg" :class="err ? 'err' : 'ok'">{{ msg }}</div>
+          <button class="btn btn-primary btn-block" type="submit" :disabled="busy">
+            <span class="spinner" v-if="busy" aria-hidden="true"></span>
+            {{ busy ? '登录中…' : '登 录' }}
+          </button>
+        </form>
+      </div>`,
+    methods: {
+      doLogin: function(){
+        var self = this;
+        var u = this.username.trim(), p = this.password;
+        if (!u || !p) { this.msg = '请输入用户名和密码'; this.err = true; return; }
+        this.busy = true; this.msg = ''; this.err = false;
+        api('/api/mc/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ username: u, password: p }),
+        })
+        .then(function(j){
+          if (!j || j.code !== 0 || !(j.data && j.data.token)) {
+            self.msg = (j && j.msg) || '登录失败'; self.err = true; return;
+          }
+          try { localStorage.setItem(TOKEN_KEY, j.data.token); } catch (e) {}
+          setSession({ username: j.data.username, role: j.data.role });
+          toast('欢迎回来，' + j.data.username, 'ok');
+          router.replace(self.$route.query.redirect || '/workflow');
+        })
+        .catch(function(e){
+          self.msg = e.message || '请求失败'; self.err = true;
+        })
+        .finally(function(){ self.busy = false; });
+      },
+    },
+  };
+
+  // ============================================================ 主布局
+  var Layout = {
+    data: function(){
+      return { user: getSession() };
+    },
+    computed: {
+      userInitial: function(){
+        var u = this.user && this.user.username;
+        return u ? u.charAt(0).toUpperCase() : '?';
+      },
+      roleText: function(){
+        var r = this.user && this.user.role;
+        return r === 'super' ? '超级管理员' : (r ? '管理员' : '');
+      },
+    },
+    template: `
+      <div class="layout-root">
+        <header class="topbar">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="6" r="2.6"/><circle cx="19" cy="18" r="2.6"/><path d="M7.4 10.7l9.3-3.5M7.4 13.3l9.3 3.5"/></svg>
+            </div>
+            <div class="brand-text">
+              <span class="brand-title">minecraftconsole</span>
+              <span class="brand-sub">remote MC 控制台</span>
+            </div>
+          </div>
+          <span class="spacer"></span>
+          <div class="user-chip" title="当前登录用户">
+            <span class="user-avatar">{{ userInitial }}</span>
+            <span class="user-meta">
+              <span class="user-name">{{ user ? user.username : '未登录' }}</span>
+              <span class="user-role">{{ roleText }}</span>
+            </span>
+          </div>
+          <button class="btn btn-ghost btn-sm" @click="logout" title="退出登录">登出</button>
+        </header>
+        <div class="layout-body">
+          <aside class="side-nav" aria-label="主导航">
+            <router-link to="/workflow" class="nav-item" active-class="nav-active">
+              <span class="nav-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="6" r="2.6"/><circle cx="19" cy="18" r="2.6"/><path d="M7.4 10.7l9.3-3.5M7.4 13.3l9.3 3.5"/></svg></span>
+              工作流编排
+            </router-link>
+            <router-link to="/files" class="nav-item" active-class="nav-active">
+              <span class="nav-ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
+              文件管理
+            </router-link>
+          </aside>
+          <main class="view-host">
+            <router-view></router-view>
+          </main>
+        </div>
+      </div>`,
+    mounted: function(){
+      var self = this;
+      // 拉取当前登录用户（顺带校验 token 是否仍有效，401 由 api() 自动跳登录）
+      api('/api/mc/auth/me').then(function(j){
+        if (j && j.code === 0 && j.data) {
+          self.user = j.data;
+          setSession(j.data);
+        }
+      }).catch(function(){});
+    },
+    methods: {
+      logout: function(){
+        var self = this;
+        api('/api/mc/auth/logout', { method: 'POST' })
+          .catch(function(){})
+          .finally(function(){
+            clearSession();
+            router.push('/login');
+          });
+      },
+    },
+  };
+
+  // ============================================================ 工作流画布
+  var NODE_W = 180, NODE_H = 76;
+  var COLORS = { trigger:'#6366f1', action:'#22c55e', condition:'#f59e0b', end:'#ef4444' };
+  var TITLES = { trigger:'触发', action:'动作', condition:'条件', end:'结束' };
+  var DESCS = {
+    trigger:   '指令命中入口',
+    action:    '执行命令并累积结果',
+    condition: '按结果走 true / false',
+    end:       '返回累积结果',
+  };
+  var DEFAULT_CONFIG = {
+    trigger:   { match:'', match_type:'prefix' },
+    action:    { action:'exec', command:'' },
+    condition: { test:'', match_type:'contains', true_port:'T', false_port:'F' },
+    end:       { return:true },
+  };
+  var ICONS = {
+    trigger:   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>',
+    action:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+    condition: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>',
+    end:       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>',
+  };
+  var uid = (function(){ var i = 0; return function(p){ i += 1; return (p||'id') + '_' + Date.now().toString(36) + '_' + i; }; })();
+
+  var WorkflowView = {
+    data: function(){
+      return {
+        workflows: [], currentId: null,
+        wfName: '', wfEnabled: true,
+        wfSendEnabled: false, wfSendTo: 'trigger', wfSendId: '',
+        nodes: [], edges: [],
+        selected: null,          // {kind:'node'|'edge', id}
+        drag: null,              // {id, ox, oy, rect}
+        wire: null,              // {from, x, y} 连线预览
+        instruction: '', output: '',
+        busySave: false, busyRun: false,
+        msg: '', msgOk: true,
+        consoleOpen: true,
+        nodeTypes: [
+          { type:'trigger',   name:'触发',  desc:DESCS.trigger,   color:COLORS.trigger },
+          { type:'action',    name:'动作',  desc:DESCS.action,    color:COLORS.action },
+          { type:'condition', name:'条件',  desc:DESCS.condition, color:COLORS.condition },
+          { type:'end',       name:'结束',  desc:DESCS.end,       color:COLORS.end },
+        ],
+      };
+    },
+    computed: {
+      currentWorkflow: function(){
+        var self = this;
+        return self.workflows.find(function(w){ return w.id === self.currentId; }) || null;
+      },
+      currentNode: function(){
+        return this.selected && this.selected.kind === 'node'
+          ? this.nodeById(this.selected.id) : null;
+      },
+      currentEdge: function(){
+        return this.selected && this.selected.kind === 'edge'
+          ? this.edges.find(function(e){ return e.id === this.selected.id; }, this) : null;
+      },
+      edgeSourceIsCondition: function(){
+        var e = this.currentEdge;
+        if (!e) return false;
+        var src = this.nodeById(e.from);
+        return !!(src && src.type === 'condition');
+      },
+      fromLabel: function(){
+        var e = this.currentEdge; if (!e) return '';
+        var n = this.nodeById(e.from); return n ? (n.label || n.id) : e.from;
+      },
+      toLabel: function(){
+        var e = this.currentEdge; if (!e) return '';
+        var n = this.nodeById(e.to); return n ? (n.label || n.id) : e.to;
+      },
+      edgeViews: function(){
+        var self = this, out = [];
+        this.edges.forEach(function(e){
+          var a = self.nodeById(e.from), b = self.nodeById(e.to);
+          if (!a || !b) return;
+          var p1 = self.portPos(a, 'out'), p2 = self.portPos(b, 'in');
+          var d = self.curve(p1, p2);
+          var src = self.nodeById(e.from);
+          var isCond = src && src.type === 'condition';
+          var isFalse = isCond && e.port === 'false';
+          var color = isCond ? (isFalse ? '#f87171' : '#34d399') : '#818cf8';
+          var label = '';
+          if (isCond) {
+            var cfg = src.config || {};
+            label = isFalse ? (cfg.false_port || 'F') : (cfg.true_port || 'T');
+          }
+          out.push({
+            id: e.id, d: d, color: color,
+            mkey: isCond ? (isFalse ? 'r' : 'g') : 'b',
+            label: label,
+            lx: (p1.x + p2.x) / 2, ly: (p1.y + p2.y) / 2 + 18,
+          });
+        });
+        return out;
+      },
+      wireView: function(){
+        if (!this.wire) return null;
+        var src = this.nodeById(this.wire.from);
+        if (!src) return null;
+        return this.curve(this.portPos(src, 'out'), { x: this.wire.x, y: this.wire.y });
+      },
+    },
+    methods: {
+      // ---------- 基础（委托到全局会话 API / Toast） ----------
+      api: function(path, opts){ return api(path, opts); },
+      toast: function(text, type){ toast(text, type); },
+      nodeById: function(id){ return this.nodes.find(function(n){ return n.id === id; }); },
+      isSelected: function(kind, id){
+        return !!(this.selected && this.selected.kind === kind && this.selected.id === id);
+      },
+      colorOf: function(t){ return COLORS[t] || '#8b93ad'; },
+      colorSoft: function(t){
+        return { trigger:'rgba(99,102,241,.14)', action:'rgba(34,197,94,.13)',
+                 condition:'rgba(245,158,11,.13)', end:'rgba(239,68,68,.13)' }[t] || 'rgba(120,130,170,.13)';
+      },
+      typeLabel: function(t){ return TITLES[t] || t; },
+      iconOf: function(t){ return ICONS[t] || ''; },
+      summary: function(n){
+        var c = n.config || {};
+        if (n.type === 'trigger') return (c.match_type === 'regex' ? '~ ' : '= ') + (c.match || '(空)');
+        if (n.type === 'action') return (c.command || '(无命令)');
+        if (n.type === 'condition') return (c.match_type === 'regex' ? '~ ' : '∈ ') + (c.test || '(空)');
+        if (n.type === 'end') return c.return ? '返回累积结果' : '仅返回最后一步';
+        return '';
+      },
+      nodeStyle: function(n){
+        return { transform: 'translate(' + n.x + 'px,' + n.y + 'px)', '--c': this.colorOf(n.type) };
+      },
+      portPos: function(n, kind){
+        return { x: n.x + (kind === 'out' ? NODE_W : 0), y: n.y + NODE_H / 2 };
+      },
+      curve: function(a, b){
+        var dx = Math.max(70, Math.abs(b.x - a.x) * 0.5);
+        return 'M ' + a.x.toFixed(1) + ' ' + a.y.toFixed(1) +
+               ' C ' + (a.x + dx).toFixed(1) + ' ' + a.y.toFixed(1) +
+               ', ' + (b.x - dx).toFixed(1) + ' ' + b.y.toFixed(1) +
+               ', ' + b.x.toFixed(1) + ' ' + b.y.toFixed(1);
+      },
+      showMsg: function(text, ok){
+        this.msg = text; this.msgOk = !!ok;
+      },
+
+      // ---------- 工作流管理 ----------
+      loadAll: function(){
+        var self = this;
+        return this.api('/api/mc/workflow')
+          .then(function(j){
+            if (j.code !== 0) { self.showMsg('加载失败: ' + (j.msg || j.code), false); self.toast('加载工作流列表失败', 'err'); return; }
+            self.workflows = j.data || [];
+            if (!self.currentId || !self.workflows.some(function(w){ return w.id === self.currentId; })) {
+              self.currentId = self.workflows.length ? self.workflows[0].id : null;
+            }
+            self.applyCurrent();
+          })
+          .catch(function(e){ self.showMsg('加载失败: ' + e.message, false); self.toast('加载工作流列表失败', 'err'); });
+      },
+      applyCurrent: function(){
+        var w = this.currentWorkflow;
+        if (!w) { this.nodes = []; this.edges = []; this.wfName = ''; this.wfEnabled = true; this.selected = null; return; }
+        this.nodes = JSON.parse(JSON.stringify(w.nodes || []));
+        this.edges = JSON.parse(JSON.stringify(w.edges || []));
+        this.wfName = w.name || w.id;
+        this.wfEnabled = !!w.enabled;
+        var send = w.send || {};
+        this.wfSendEnabled = !!send.enabled;
+        this.wfSendTo = send.to || 'trigger';
+        this.wfSendId = send.target_id != null ? String(send.target_id) : '';
+        this.selected = null;
+      },
+      selectWorkflow: function(w){
+        if (!w || w.id === this.currentId) return;
+        var self = this;
+        // 先保存当前（含未保存编辑），再加载所选
+        this.saveCurrent(false).then(function(){
+          self.currentId = w.id;
+          self.applyCurrent();
+        });
+      },
+      toggleEnabled: function(w){
+        if (!w) return;
+        w.enabled = !w.enabled;
+        if (w.id === this.currentId) {
+          this.wfEnabled = !!w.enabled;
+          this.toast(w.enabled ? '已启用（保存后生效）' : '已停用（保存后生效）', 'info');
+          return;
+        }
+        var self = this;
+        this.savePayload(w).then(function(saved){
+          var i = self.workflows.findIndex(function(x){ return x.id === saved.id; });
+          if (i >= 0) self.workflows[i] = saved;
+          self.toast(saved.enabled ? '已启用「' + (saved.name || saved.id) + '」' : '已停用「' + (saved.name || saved.id) + '」', 'ok');
+        }).catch(function(e){ self.toast('状态更新失败: ' + e.message, 'err'); });
+      },
+      newWorkflow: function(){
+        var w = { id: uid('wf'), name: '新工作流', enabled: true, nodes: [], edges: [] };
+        var self = this;
+        this.savePayload(w).then(function(){
+          self.workflows.push(w);
+          self.currentId = w.id;
+          self.applyCurrent();
+          self.showMsg('已新建工作流，添加节点后点击保存', true);
+          self.toast('已新建工作流，添加节点后点击保存', 'ok');
+        }).catch(function(e){ self.showMsg('新建失败: ' + e.message, false); self.toast('新建失败', 'err'); });
+      },
+      removeWorkflow: function(w){
+        if (!w) return;
+        if (!confirm('确认删除工作流 [' + (w.name || w.id) + '] ？')) return;
+        var self = this;
+        this.api('/api/mc/workflow/' + encodeURIComponent(w.id), { method: 'DELETE' }).then(function(j){
+          if (j.code !== 0) { self.showMsg('删除失败: ' + (j.msg || j.code), false); self.toast('删除失败', 'err'); return; }
+          var removingCurrent = w.id === self.currentId;
+          self.workflows = self.workflows.filter(function(x){ return x.id !== w.id; });
+          if (removingCurrent) {
+            self.currentId = self.workflows.length ? self.workflows[0].id : null;
+            self.applyCurrent();
+          }
+          self.toast('已删除「' + (w.name || w.id) + '」', 'ok');
+        });
+      },
+      savePayload: function(wf){
+        var self = this;
+        return this.api('/api/mc/workflow', { method: 'POST', body: JSON.stringify(wf) })
+          .then(function(j){
+            if (j.code !== 0) throw new Error(j.msg || ('code ' + j.code));
+            return j.data || wf;
+          });
+      },
+      saveCurrent: function(toast){
+        var self = this;
+        var w = this.currentWorkflow;
+        if (!w) { this.showMsg('请先新建工作流', false); return Promise.reject('no-workflow'); }
+        this.busySave = true;
+        var payload = {
+          id: w.id, name: this.wfName || w.id, enabled: !!this.wfEnabled,
+          nodes: this.nodes, edges: this.edges,
+          send: { enabled: !!this.wfSendEnabled, to: this.wfSendTo || 'trigger', target_id: this.wfSendId },
+        };
+        return this.savePayload(payload)
+          .then(function(saved){
+            var i = self.workflows.findIndex(function(x){ return x.id === saved.id; });
+            if (i >= 0) self.workflows[i] = saved;
+            if (toast !== false) {
+              self.showMsg('已保存 ✓', true);
+              self.toast('工作流已保存', 'ok');
+            }
+            return saved;
+          })
+          .catch(function(e){ self.showMsg('保存失败: ' + e.message, false); throw e; })
+          .finally(function(){ self.busySave = false; });
+      },
+      testRun: function(){
+        var self = this;
+        var w = this.currentWorkflow;
+        if (!w) { this.showMsg('请先新建工作流', false); return; }
+        this.busyRun = true;
+        this.consoleOpen = true;
+        this.output = '运行中…';
+        // 先保存当前状态，确保服务端能按最新版本测试
+        this.saveCurrent(false)
+          .then(function(){
+            return self.api('/api/mc/workflow/' + encodeURIComponent(w.id) + '/run', {
+              method: 'POST',
+              body: JSON.stringify({ instruction: self.instruction || '' }),
+            });
+          })
+          .then(function(j){
+            if (j.code !== 0) { self.output = ''; self.showMsg('运行失败: ' + (j.msg || j.code), false); self.toast('测试运行失败', 'err'); return; }
+            self.output = '[工作流] ' + (j.data && j.data.workflow) + '\n[输入] ' + (j.data && j.data.instruction) + '\n[结果] ' + (j.data && j.data.result);
+            self.showMsg('运行完成', true);
+            self.toast('测试运行完成', 'ok');
+          })
+          .catch(function(e){ self.showMsg('运行请求失败: ' + e.message, false); self.toast('测试运行请求失败', 'err'); })
+          .finally(function(){ self.busyRun = false; });
+      },
+
+      // ---------- 节点 / 连线编辑 ----------
+      addNode: function(type, pos){
+        if (!this.currentWorkflow) { this.toast('请先新建工作流', 'err'); return; }
+        var w = this.canvasRect();
+        var x = pos ? pos.x - NODE_W / 2 : Math.round(30 + Math.random() * Math.max(40, (w.width || 900) - NODE_W - 60));
+        var y = pos ? pos.y - NODE_H / 2 : Math.round(30 + Math.random() * Math.max(40, (w.height || 500) - NODE_H - 60));
+        x = Math.round(Math.max(8, Math.min((w.width || 900) - NODE_W - 8, x)));
+        y = Math.round(Math.max(8, Math.min((w.height || 500) - NODE_H - 8, y)));
+        var n = {
+          id: uid('n'), type: type, label: TITLES[type] + (this.nodes.length + 1),
+          x: x, y: y,
+          config: JSON.parse(JSON.stringify(DEFAULT_CONFIG[type] || {})),
+        };
+        this.nodes.push(n);
+        this.selected = { kind: 'node', id: n.id };
+        this.toast('已添加「' + TITLES[type] + '」节点，配置后记得保存', 'ok');
+      },
+      onLibDragStart: function(e, type){
+        e.dataTransfer.setData('text/plain', type);
+        e.dataTransfer.effectAllowed = 'copy';
+      },
+      onCanvasDragOver: function(e){
+        if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.indexOf('text/plain') >= 0) {
+          e.dataTransfer.dropEffect = 'copy';
+        }
+      },
+      onCanvasDrop: function(e){
+        e.preventDefault();
+        var type = e.dataTransfer.getData('text/plain');
+        if (!type) return;
+        var r = this.$refs.canvas.getBoundingClientRect();
+        // 落点换算并钳制在画布内，避免节点一半出界导致「拖出来后点不动」
+        var x = e.clientX - r.left - NODE_W / 2;
+        var y = e.clientY - r.top - 16;
+        x = Math.max(2, Math.min(Math.max(0, r.width - NODE_W - 4), x));
+        y = Math.max(2, Math.min(Math.max(0, r.height - NODE_H - 4), y));
+        this.addNode(type, { x: Math.round(x), y: Math.round(y) });
+      },
+      removeNode: function(id){
+        var self = this;
+        this.nodes = this.nodes.filter(function(n){ return n.id !== id; });
+        this.edges = this.edges.filter(function(e){ return e.from !== id && e.to !== id; });
+        if (this.selected && this.selected.id === id) this.selected = null;
+        this.toast('已删除节点', 'ok');
+      },
+      addEdge: function(from, to, port){
+        var exists = this.edges.some(function(e){ return e.from === from && e.to === to && e.port === port; });
+        if (exists) { this.showMsg('该连线已存在', false); return; }
+        var e = { id: uid('e'), from: from, to: to, port: port || '' };
+        this.edges.push(e);
+        this.selected = { kind: 'edge', id: e.id };
+      },
+      removeEdge: function(id){
+        this.edges = this.edges.filter(function(e){ return e.id !== id; });
+        if (this.selected && this.selected.kind === 'edge' && this.selected.id === id) this.selected = null;
+        this.toast('已删除连线', 'ok');
+      },
+      selectNodeById: function(id){ this.selected = { kind: 'node', id: id }; },
+      selectEdgeById: function(id){ this.selected = { kind: 'edge', id: id }; },
+      clearSelect: function(){ this.selected = null; },
+      onKeydown: function(e){
+        if ((e.key === 'Delete' || e.key === 'Backspace') && this.selected) {
+          var el = e.target;
+          var typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT');
+          if (typing) return;      // 输入框中不触发删除
+          if (this.selected.kind === 'node') this.removeNode(this.selected.id);
+          else this.removeEdge(this.selected.id);
+        }
+      },
+
+      // ---------- 拖拽 / 连线（Pointer 事件 + transform） ----------
+      canvasRect: function(){
+        var el = this.$refs.canvas;
+        if (!el) return { width: 900, height: 500 };
+        var r = el.getBoundingClientRect();
+        return { width: r.width, height: r.height };
+      },
+      bindGlobal: function(){
+        window.addEventListener('pointermove', this.onGlobalMove);
+        window.addEventListener('pointerup', this.onGlobalUp);
+      },
+      unbindGlobal: function(){
+        window.removeEventListener('pointermove', this.onGlobalMove);
+        window.removeEventListener('pointerup', this.onGlobalUp);
+      },
+      startDrag: function(e, n){
+        if (!this.currentWorkflow) return;
+        e.preventDefault();
+        this.selected = { kind: 'node', id: n.id };
+        var r = this.$refs.canvas.getBoundingClientRect();
+        this.drag = { id: n.id, ox: e.clientX - n.x, oy: e.clientY - n.y, rect: r };
+        try { if (e.currentTarget && e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+        this.bindGlobal();
+      },
+      startWire: function(e, n){
+        if (!this.currentWorkflow) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var r = this.$refs.canvas.getBoundingClientRect();
+        this.wire = { from: n.id, x: e.clientX - r.left, y: e.clientY - r.top };
+        try { if (e.currentTarget && e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId); } catch (err) {}
+        this.bindGlobal();
+      },
+      onGlobalMove: function(e){
+        if (this.drag) {
+          var n = this.nodeById(this.drag.id);
+          if (n) {
+            var r = this.drag.rect;
+            var maxX = Math.max(0, r.width - NODE_W - 4), maxY = Math.max(0, r.height - NODE_H - 4);
+            n.x = Math.round(Math.max(2, Math.min(maxX, e.clientX - this.drag.ox)));
+            n.y = Math.round(Math.max(2, Math.min(maxY, e.clientY - this.drag.oy)));
+          }
+        }
+        if (this.wire) {
+          var r = this.$refs.canvas.getBoundingClientRect();
+          this.wire.x = e.clientX - r.left;
+          this.wire.y = e.clientY - r.top;
+        }
+      },
+      onGlobalUp: function(e){
+        if (this.wire) {
+          var r = this.$refs.canvas.getBoundingClientRect();
+          var mx = e.clientX - r.left, my = e.clientY - r.top;
+          var src = this.nodeById(this.wire.from);
+          var target = this.nodes.find(function(n){
+            return n.id !== this.wire.from && mx >= n.x && mx <= n.x + NODE_W && my >= n.y && my <= n.y + NODE_H;
+          }, this);
+          if (target && src) {
+            var port = (src.type === 'condition') ? 'true' : '';
+            this.addEdge(src.id, target.id, port);
+            this.showMsg('已连线（条件分支可在右侧切换 true/false）', true);
+            this.toast('已连线', 'ok');
+          }
+          this.wire = null;
+        }
+        this.drag = null;
+        this.unbindGlobal();
+      },
+    },
+    template: `
+      <div class="wf-view">
+        <!-- 工作流工具条 -->
+        <div class="topbar">
+          <div class="wf-name-box">
+            <span>工作流</span>
+            <input type="text" v-model="wfName" :disabled="!currentWorkflow"
+                   placeholder="选择或新建一个工作流" aria-label="工作流名称">
+          </div>
+          <label class="sw-label" title="启用后参与指令匹配">
+            <input type="checkbox" v-model="wfEnabled" :disabled="!currentWorkflow">
+            <span class="sw-track"></span>
+            <span class="sw-text">{{ wfEnabled ? '已启用' : '已停用' }}</span>
+          </label>
+          <span class="spacer"></span>
+          <button class="btn btn-primary" @click="saveCurrent()" :disabled="busySave || !currentWorkflow">
+            <span class="spinner" v-if="busySave" aria-hidden="true"></span>
+            <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+            {{ busySave ? '保存中…' : '保存' }}
+          </button>
+          <button class="btn btn-success" @click="testRun" :disabled="busyRun || !currentWorkflow">
+            <span class="spinner" v-if="busyRun" aria-hidden="true"></span>
+            <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+            {{ busyRun ? '运行中…' : '测试运行' }}
+          </button>
+        </div>
+
+        <!-- 执行后发送 独立工具条（明显可找） -->
+        <div class="sendbar" v-if="currentWorkflow" title="执行完成后如何发送结果消息">
+          <span class="sendbar-label">📨 执行后发送结果：</span>
+          <label class="sendcfg">
+            <input type="checkbox" v-model="wfSendEnabled">
+            <span>开启</span>
+          </label>
+          <template v-if="wfSendEnabled">
+            <span class="sendcfg">
+              发送给
+              <select v-model="wfSendTo" aria-label="发送给">
+                <option value="trigger">触发人</option>
+                <option value="qq">指定 QQ</option>
+                <option value="group">指定群</option>
+              </select>
+            </span>
+            <span class="sendcfg" v-if="wfSendTo !== 'trigger'">
+              目标号码
+              <input type="text" v-model="wfSendId" placeholder="如 123456789" style="width:120px" aria-label="目标号码">
+            </span>
+          </template>
+          <span class="sendcfg" v-else style="color:var(--text-3)">（默认把结果回复给触发消息的人/群）</span>
+        </div>
+
+        <!-- 测试运行台 -->
+        <section class="console" v-show="consoleOpen" aria-label="测试运行台">
+          <div class="console-bar">
+            <span class="c-title">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+              测试运行台
+            </span>
+            <span class="c-hint">mock 执行器 · 不实际发命令，仅演示引擎流转</span>
+            <button class="btn btn-ghost btn-sm c-toggle" @click="consoleOpen = false" title="收起">收起 ▲</button>
+          </div>
+          <div class="console-body">
+            <div class="run-row">
+              <input type="text" v-model="instruction" placeholder="输入模拟指令文本，如 backup（回车运行）"
+                     @keydown.enter="testRun" :disabled="!currentWorkflow" aria-label="模拟指令文本">
+              <button class="btn btn-success" @click="testRun" :disabled="busyRun || !currentWorkflow">
+                <span class="spinner" v-if="busyRun" aria-hidden="true"></span>
+                <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+                运行
+              </button>
+            </div>
+            <div class="output" :class="{idle: !output}">{{ output || '（尚未运行，结果将显示在这里）' }}</div>
+            <div class="msg" :class="msgOk ? 'ok' : 'err'">{{ msg }}</div>
+          </div>
+        </section>
+
+        <!-- 主体三栏 -->
+        <main class="layout">
+          <!-- 左栏 -->
+          <div class="col-left" style="display:flex;flex-direction:column;gap:12px;min-height:0">
+            <!-- 工作流列表 -->
+            <section class="panel" style="flex-shrink:0;max-height:46%">
+              <div class="panel-head">
+                <h2>工作流</h2>
+                <span class="count">{{ workflows.length }}</span>
+                <span class="grow"></span>
+                <button class="btn btn-ghost btn-sm" @click="loadAll" title="刷新列表" aria-label="刷新列表">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                </button>
+                <button class="btn btn-primary btn-sm" @click="newWorkflow">＋ 新建</button>
+              </div>
+              <div class="panel-body" style="padding-top:2px">
+                <div class="wf-list">
+                  <div v-for="w in workflows" :key="w.id" class="wf-item"
+                       :class="{active: w.id === currentId}" @click="selectWorkflow(w)">
+                    <span class="wf-dot" :class="{on: !!w.enabled}" title="启用状态"></span>
+                    <div class="wf-meta">
+                      <span class="wf-name">{{ w.name || w.id }}</span>
+                      <span class="wf-id">{{ w.id }}</span>
+                    </div>
+                    <label class="sw-label" style="padding:0;background:none;border:none" @click.stop
+                           :title="w.enabled ? '停用（其他工作流即时生效）' : '启用（其他工作流即时生效）'">
+                      <input type="checkbox" :checked="!!w.enabled" @change="toggleEnabled(w)" aria-label="启用开关">
+                      <span class="sw-track"></span>
+                    </label>
+                    <button class="wf-del" @click.stop="removeWorkflow(w)" title="删除工作流" aria-label="删除工作流">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                    </button>
+                  </div>
+                  <div v-if="!workflows.length" class="list-empty">
+                    暂无工作流<br>点击右上角「＋ 新建」创建
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- 节点库 -->
+            <section class="panel lib" style="flex:1">
+              <div class="panel-head">
+                <h2>节点库</h2>
+                <span class="count">4</span>
+                <span class="grow"></span>
+                <span style="font-size:var(--fs-xs);color:var(--text-3)">拖入 / 点击添加</span>
+              </div>
+              <div class="lib-list">
+                <div class="lib-item" v-for="t in nodeTypes" :key="t.type"
+                     draggable="true" @dragstart="onLibDragStart($event, t.type)" @click="addNode(t.type)"
+                     :title="'添加「' + t.name + '」节点（可拖入画布）'">
+                  <span class="lib-icon" :style="{color: t.color, background: colorSoft(t.type)}"
+                        v-html="iconOf(t.type)" aria-hidden="true"></span>
+                  <span class="lib-meta">
+                    <span class="lib-name">{{ t.name }}</span>
+                    <span class="lib-desc">{{ t.desc }}</span>
+                  </span>
+                  <span class="lib-plus" aria-hidden="true">＋</span>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <!-- 中栏 · 画布 -->
+          <section class="canvas-wrap" @dragover.prevent="onCanvasDragOver" @drop.prevent="onCanvasDrop">
+            <svg class="edges" @pointerdown.prevent>
+              <defs>
+                <marker id="arr-b" orient="auto" refX="5.5" refY="3" markerWidth="8" markerHeight="8"><path d="M0,0 L6,3 L0,6 z" fill="#818cf8"/></marker>
+                <marker id="arr-g" orient="auto" refX="5.5" refY="3" markerWidth="8" markerHeight="8"><path d="M0,0 L6,3 L0,6 z" fill="#34d399"/></marker>
+                <marker id="arr-r" orient="auto" refX="5.5" refY="3" markerWidth="8" markerHeight="8"><path d="M0,0 L6,3 L0,6 z" fill="#f87171"/></marker>
+              </defs>
+              <rect width="100%" height="100%" fill="transparent" style="pointer-events:none"></rect>
+              <g v-for="ev in edgeViews" :key="ev.id">
+                <path class="ehit" :d="ev.d" @click.stop="selectEdgeById(ev.id)" @dblclick.stop="removeEdge(ev.id)"></path>
+                <path class="evis" :d="ev.d" :stroke="ev.color" stroke-width="2" fill="none"
+                      :marker-end="'url(#arr-' + ev.mkey + ')'"
+                      :class="{hot: isSelected('edge', ev.id)}"
+                      @click.stop="selectEdgeById(ev.id)" @dblclick.stop="removeEdge(ev.id)"></path>
+                <text v-if="ev.label" class="edge-label" :x="ev.lx" :y="ev.ly" text-anchor="middle" :fill="ev.color">{{ ev.label }}</text>
+              </g>
+              <path v-if="wireView" class="wire" :d="wireView"></path>
+            </svg>
+
+            <div class="canvas" ref="canvas" @pointerdown.self="clearSelect">
+              <!-- 空画布引导 -->
+              <div v-if="!nodes.length" class="canvas-empty">
+                <div class="ce-icon" aria-hidden="true">
+                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                    <circle cx="5" cy="12" r="2.6"/><circle cx="19" cy="6" r="2.6"/><circle cx="19" cy="18" r="2.6"/>
+                    <path d="M7.4 10.7l9.3-3.5M7.4 13.3l9.3 3.5"/>
+                  </svg>
+                </div>
+                <div class="ce-title">将自动化流程可视化为节点图</div>
+                <div class="ce-tip">
+                  从左侧「节点库」<span class="ce-kbd">拖入</span>或<span class="ce-kbd">点击</span>添加节点；<br>
+                  拖动节点右侧输出端口到另一节点即可连线。<br>
+                  条件节点按运行结果自动分派 <b style="color:var(--ok)">true</b> / <b style="color:var(--danger)">false</b> 分支。
+                </div>
+              </div>
+
+              <!-- 节点卡片 -->
+              <div v-for="n in nodes" :key="n.id" class="node" :class="{selected: isSelected('node', n.id)}"
+                   :style="nodeStyle(n)" @pointerdown="startDrag($event, n)" @click.stop="selectNodeById(n.id)">
+                <div class="node-head">
+                  <span class="node-icon" v-html="iconOf(n.type)" aria-hidden="true"></span>
+                  <span class="node-title">{{ n.label }}</span>
+                  <span class="node-type">{{ typeLabel(n.type) }}</span>
+                </div>
+                <div class="node-body">{{ summary(n) }}</div>
+                <div class="port port-in" :class="{live: !!wire}" title="输入端口 · 连线目标"></div>
+                <div class="port port-out" :class="{live: !!wire}" @pointerdown.stop.prevent="startWire($event, n)"
+                     title="输出端口 · 拖出连线到目标节点"></div>
+              </div>
+            </div>
+
+            <div class="canvas-hint">
+              <span><span class="kbd">Delete</span> 删除选中</span>
+              <span>双击连线删除</span>
+              <span>条件分支在右侧切换 true / false</span>
+            </div>
+            <div class="canvas-stats">{{ nodes.length }} 节点 · {{ edges.length }} 连线</div>
+          </section>
+
+          <!-- 右栏 · 属性检查器 -->
+          <aside class="col-right panel" style="min-width:0">
+            <div class="panel-head">
+              <h2>属性检查器</h2>
+              <span class="grow"></span>
+              <span v-if="currentNode" class="count">{{ typeLabel(currentNode.type) }}</span>
+              <span v-else-if="currentEdge" class="count">连线</span>
+            </div>
+            <div class="panel-body insp-body">
+              <!-- 节点属性 -->
+              <template v-if="currentNode">
+                <div class="group-title"><span class="gt-ico">▣</span>基本信息</div>
+                <div class="node-preview">
+                  <span class="np-icon" :style="{color: colorOf(currentNode.type), background: colorSoft(currentNode.type)}"
+                        v-html="iconOf(currentNode.type)" aria-hidden="true"></span>
+                  <div class="np-meta">
+                    <span class="np-name">{{ currentNode.label }}</span>
+                    <span class="np-type">{{ typeLabel(currentNode.type) }} · {{ currentNode.id }}</span>
+                  </div>
+                </div>
+                <div class="field">
+                  <label>节点标签</label>
+                  <input type="text" v-model="currentNode.label" placeholder="如：执行备份">
+                </div>
+
+                <template v-if="currentNode.type === 'trigger'">
+                  <div class="group-title"><span class="gt-ico">⚡</span>触发配置</div>
+                  <div class="field">
+                    <label>匹配文本（match）</label>
+                    <input type="text" v-model="currentNode.config.match" placeholder="如 backup">
+                  </div>
+                  <div class="field">
+                    <label>匹配方式</label>
+                    <select v-model="currentNode.config.match_type">
+                      <option value="prefix">前缀匹配（prefix）</option>
+                      <option value="regex">正则匹配（regex）</option>
+                    </select>
+                  </div>
+                </template>
+
+                <template v-if="currentNode.type === 'action'">
+                  <div class="group-title"><span class="gt-ico">⚙</span>动作配置</div>
+                  <div class="field">
+                    <label>动作类型（供语义参考，指令原样下发）</label>
+                    <select v-model="currentNode.config.action">
+                      <option value="exec">exec（执行命令）</option>
+                      <option value="query">query（查询）</option>
+                      <option value="fs">fs（文件系统）</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label>命令（支持 {last} 引用上一结果）</label>
+                    <textarea v-model="currentNode.config.command" placeholder="EXEC|save-all"></textarea>
+                  </div>
+                </template>
+
+                <template v-if="currentNode.type === 'condition'">
+                  <div class="group-title"><span class="gt-ico">⑂</span>条件分支</div>
+                  <div class="field">
+                    <label>测试文本（对 {last} 判断）</label>
+                    <input type="text" v-model="currentNode.config.test" placeholder="成功 / \b备份完成\b">
+                  </div>
+                  <div class="field">
+                    <label>判断方式</label>
+                    <select v-model="currentNode.config.match_type">
+                      <option value="contains">包含（contains）</option>
+                      <option value="regex">正则（regex）</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label>true 分支标签（显示在连线上）</label>
+                    <input type="text" v-model="currentNode.config.true_port" placeholder="T">
+                  </div>
+                  <div class="field">
+                    <label>false 分支标签</label>
+                    <input type="text" v-model="currentNode.config.false_port" placeholder="F">
+                  </div>
+                </template>
+
+                <template v-if="currentNode.type === 'end'">
+                  <div class="group-title"><span class="gt-ico">◉</span>结束行为</div>
+                  <div class="field">
+                    <label class="chk"><input type="checkbox" v-model="currentNode.config.return">
+                      返回累积结果（取消勾选则仅返回最后一步）</label>
+                  </div>
+                </template>
+
+                <div class="group-title"><span class="gt-ico" style="color:var(--danger)">⚠</span>操作</div>
+                <button class="btn btn-danger btn-block" @click="removeNode(currentNode.id)">删除该节点</button>
+              </template>
+
+              <!-- 连线属性 -->
+              <template v-else-if="currentEdge">
+                <div class="group-title"><span class="gt-ico">⤳</span>连线信息</div>
+                <div class="node-preview">
+                  <div class="np-meta">
+                    <span class="np-name">{{ fromLabel }} → {{ toLabel }}</span>
+                    <span class="np-type">{{ currentEdge.id }}</span>
+                  </div>
+                </div>
+                <div class="field" v-if="edgeSourceIsCondition">
+                  <label>分支端口</label>
+                  <select v-model="currentEdge.port">
+                    <option value="true">true 分支</option>
+                    <option value="false">false 分支</option>
+                  </select>
+                </div>
+                <div class="field" v-else>
+                  <label>端口</label>
+                  <input type="text" value="默认（空）" disabled>
+                </div>
+                <div class="group-title"><span class="gt-ico" style="color:var(--danger)">⚠</span>操作</div>
+                <button class="btn btn-danger btn-block" @click="removeEdge(currentEdge.id)">删除连线</button>
+              </template>
+
+              <!-- 空状态 -->
+              <div v-else class="insp-empty">
+                <span class="ie-ico">◈</span>
+                选中节点可编辑其配置；<br>选中连线可查看 / 切换分支。<br>
+                <ul>
+                  <li>触发节点：决定哪些指令命中本流程</li>
+                  <li>动作节点：执行命令并累积结果</li>
+                  <li>条件节点：按结果走 true / false 分支</li>
+                </ul>
+              </div>
+            </div>
+          </aside>
+        </main>
+      </div>`,
+    mounted: function(){
+      var self = this;
+      window.addEventListener('keydown', this.onKeydown);
+      this.loadAll();
+    },
+    beforeUnmount: function(){
+      window.removeEventListener('keydown', this.onKeydown);
+      this.unbindGlobal();
+    },
+  };
+
+  // ============================================================ 文件管理
+  var FilesView = {
+    data: function(){
+      return {
+        path: '',             // 当前目录（'' 表示服务器根目录）
+        items: [], listHeader: '',
+        loading: false,
+        editingFile: '',      // 打开的文件路径（非空 = 编辑视图）
+        content: '', dirty: false,
+        saving: false,
+      };
+    },
+    computed: {
+      crumbSegs: function(){
+        return this.path ? this.path.split('/').filter(Boolean) : [];
+      },
+    },
+    methods: {
+      // 全走 POST /api/mc/fs（后端已鉴权）
+      apiFs: function(payload){
+        return api('/api/mc/fs', { method: 'POST', body: JSON.stringify(payload) })
+          .then(function(j){
+            if (j.code !== 0) throw new Error(j.msg || ('code ' + j.code));
+            return j.data || {};
+          });
+      },
+      crumbPath: function(i){
+        return this.crumbSegs.slice(0, i + 1).join('/');
+      },
+      goTo: function(p){
+        this.path = p || '';
+        this.refreshList();
+      },
+      goParent: function(){
+        var segs = this.crumbSegs;
+        if (!segs.length) return;
+        this.goTo(segs.slice(0, -1).join('/'));
+      },
+      refreshList: function(){
+        var self = this;
+        this.loading = true;
+        this.items = [];
+        this.listHeader = '';
+        this.apiFs({ op: 'LIST', path: this.path })
+          .then(function(resp){
+            var parsed = self.parseList(resp.output || '');
+            if (parsed.error) {
+              toast(parsed.error, 'err');
+              self.items = [];
+              self.listHeader = '';
+            } else {
+              self.listHeader = parsed.header;
+              self.items = parsed.items;
+            }
+          })
+          .catch(function(e){ toast(e.message || '列表加载失败', 'err'); })
+          .finally(function(){ self.loading = false; });
+      },
+      openItem: function(it){
+        if (!it || !it.name) return;
+        var p = this.path ? this.path + '/' + it.name : it.name;
+        if (it.type === 'D') this.goTo(p);
+        else this.readFile(p);
+      },
+      readFile: function(fpath){
+        var self = this;
+        this.editingFile = fpath;
+        this.content = '';
+        this.dirty = false;
+        this.loading = true;
+        this.apiFs({ op: 'READ', path: fpath, maxBytes: 1048576 })
+          .then(function(resp){
+            var r = self.parseRead(resp.output || '');
+            if (r.error) { toast(r.error, 'err'); self.content = resp.output || ''; }
+            else { self.content = r.content; }
+            self.dirty = false;
+          })
+          .catch(function(e){ toast(e.message || '读取失败', 'err'); })
+          .finally(function(){ self.loading = false; });
+      },
+      saveFile: function(){
+        var self = this;
+        if (!this.editingFile || this.saving) return;
+        this.saving = true;
+        this.apiFs({ op: 'WRITE', path: this.editingFile, data: this.content })
+          .then(function(resp){
+            var out = (resp.output || '').trim();
+            if (/OK/.test(out)) {
+              self.dirty = false;
+              toast('已保存 ' + self.editingFile, 'ok');
+            } else {
+              toast(out || '保存失败', 'err');
+            }
+          })
+          .catch(function(e){ toast(e.message || '保存失败', 'err'); })
+          .finally(function(){ self.saving = false; });
+      },
+      backToDir: function(){
+        this.editingFile = '';
+        this.content = '';
+        this.dirty = false;
+      },
+      // 解析 agent LIST 输出：首行 "目录 <path> (N 项):"，其后每行 type\tsize\tmtime\tname
+      parseList: function(out){
+        var lines = (out || '').split('\n');
+        var header = lines[0] || '';
+        var items = [];
+        for (var i = 1; i < lines.length; i++) {
+          var line = lines[i];
+          if (!line.trim()) continue;
+          var p = line.split('\t');
+          if (p.length < 4) continue;
+          items.push({
+            type: p[0] === 'D' ? 'D' : 'F',
+            size: p[1] || '0',
+            time: p[2] || '-',
+            name: p.slice(3).join('\t') || '',
+          });
+        }
+        return { header: header, items: items, error: /^目录 /.test(header) ? '' : (header || '未知错误') };
+      },
+      // 解析 agent READ 输出：首行 "----- <path> -----" 为头，其后为文件内容
+      parseRead: function(out){
+        var s = out || '';
+        var nl = s.indexOf('\n');
+        var first = nl >= 0 ? s.slice(0, nl) : s;
+        if (/^----- /.test(first)) {
+          return { content: nl >= 0 ? s.slice(nl + 1) : '' };
+        }
+        return { error: s.trim() };
+      },
+      fmtSize: function(s){
+        var n = parseInt(s, 10);
+        if (isNaN(n) || n < 0) return '-';
+        if (n < 1024) return n + ' B';
+        if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+        return (n / 1048576).toFixed(2) + ' MB';
+      },
+    },
+    template: `
+      <div class="files-view">
+        <!-- 工具栏：面包屑 + 上级 / 刷新 -->
+        <div class="files-toolbar">
+          <div class="crumbs" aria-label="路径面包屑">
+            <span class="crumb-root" @click="goTo('')" title="服务器根目录">根目录</span>
+            <template v-for="(seg, i) in crumbSegs" :key="i">
+              <span class="crumb-sep">/</span>
+              <span class="crumb" :class="{active: i === crumbSegs.length - 1}"
+                    @click="goTo(crumbPath(i))">{{ seg }}</span>
+            </template>
+          </div>
+          <span class="spacer"></span>
+          <button class="btn btn-ghost btn-sm" @click="goParent" :disabled="!path">上级目录</button>
+          <button class="btn btn-ghost btn-sm" @click="refreshList" :disabled="loading">
+            <span class="spinner" v-if="loading" aria-hidden="true"></span>
+            {{ loading ? '加载中…' : '刷新' }}
+          </button>
+        </div>
+
+        <!-- 目录列表视图 -->
+        <div class="files-panel" v-if="!editingFile">
+          <div class="table-wrap">
+            <table class="file-table">
+              <thead>
+                <tr><th style="width:46%">名称</th><th style="width:12%">类型</th><th style="width:18%">大小</th><th>修改时间</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="it in items" :key="it.type + ':' + it.name" class="file-row"
+                    @click="openItem(it)" :title="(it.type === 'D' ? '进入目录 ' : '打开文件 ') + it.name">
+                  <td class="file-name">
+                    <span class="file-ico" :class="it.type === 'D' ? 'dir' : 'file'">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path v-if="it.type === 'D'" d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><path v-else d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline v-if="it.type !== 'D'" points="14 2 14 8 20 8"/></svg>
+                    </span>
+                    {{ it.name }}
+                  </td>
+                  <td>{{ it.type === 'D' ? '目录' : '文件' }}</td>
+                  <td class="file-size">{{ it.type === 'D' ? '-' : fmtSize(it.size) }}</td>
+                  <td class="file-time">{{ it.time }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-if="loading" class="list-empty">加载中…</div>
+            <div v-else-if="!items.length" class="list-empty">{{ listHeader || '目录为空' }}</div>
+          </div>
+        </div>
+
+        <!-- 文件查看 / 编辑视图 -->
+        <div class="files-panel editor-panel" v-else>
+          <div class="editor-head">
+            <span class="editor-path">{{ editingFile }}</span>
+            <span class="spacer"></span>
+            <button class="btn btn-ghost btn-sm" @click="backToDir">返回目录</button>
+            <button class="btn btn-ghost btn-sm" @click="readFile(editingFile)" :disabled="loading">刷新重读</button>
+            <button class="btn btn-primary btn-sm" @click="saveFile" :disabled="saving || !dirty">
+              <span class="spinner" v-if="saving" aria-hidden="true"></span>
+              {{ saving ? '保存中…' : '保存' }}
+            </button>
+          </div>
+          <textarea class="editor" v-model="content" @input="dirty = true" spellcheck="false"
+                    placeholder="文件内容为空或读取中…"></textarea>
+          <div class="editor-status">
+            {{ editingFile }} · {{ content.length }} 字符{{ dirty ? ' · 有未保存修改' : '' }}
+          </div>
+        </div>
+      </div>`,
+    mounted: function(){
+      this.refreshList();
+    },
+  };
+
+  // ============================================================ 路由
+  router = VueRouter.createRouter({
+    history: VueRouter.createWebHashHistory(),
+    routes: [
+      { path: '/login', name: 'login', component: LoginView },
+      {
+        path: '/',
+        component: Layout,
+        redirect: '/workflow',
+        children: [
+          { path: 'workflow', name: 'workflow', component: WorkflowView },
+          { path: 'files', name: 'files', component: FilesView },
+        ],
+      },
+      { path: '/:pathMatch(.*)*', redirect: '/workflow' },
+    ],
+  });
+
+  // 路由守卫：未登录一律去 /login；已登录访问 /login 则回 /workflow
+  router.beforeEach(function(to){
+    var authed = !!getToken();
+    if (to.path !== '/login' && !authed) {
+      return { path: '/login', query: { redirect: to.fullPath } };
+    }
+    if (to.path === '/login' && authed) {
+      return '/workflow';
+    }
+    return true;
+  });
+
+  // ============================================================ 根组件
+  var Root = {
+    data: function(){
+      return { toasts: toastState.toasts };
+    },
+    template:
+      '<div class="root" v-cloak>' +
+        '<router-view></router-view>' +
+        '<div class="toasts" role="status" aria-live="polite">' +
+          '<div v-for="t in toasts" :key="t.id" class="toast" :class="\'t-\' + t.type">' +
+            '<span class="t-dot"></span>{{ t.text }}' +
+          '</div>' +
+        '</div>' +
+      '</div>',
+  };
+
+  var app = Vue.createApp(Root);
+  app.use(router);
+  app.mount('#app');
+})();
+</script>
+</body>
+</html>

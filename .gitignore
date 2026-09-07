@@ -1,0 +1,127 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ============================================================
+# 插件目录（放行内置插件，其余不上传）
+# ============================================================
+plugins/*
+!plugins/echo/
+!plugins/echo/main.py
+!plugins/echo/requirements.txt
+!plugins/help/
+!plugins/help/main.py
+!plugins/help/draw.py
+!plugins/help/requirements.txt
+!plugins/help/DouyinSansBold.otf
+!plugins/runtime_status/
+!plugins/runtime_status/main.py
+!plugins/runtime_status/requirements.txt
+!plugins/image_renderer/
+!plugins/image_renderer/main.py
+!plugins/image_renderer/requirements.txt
+!plugins/image_renderer/native/
+!plugins/image_renderer/native/Cargo.toml
+!plugins/image_renderer/native/src/
+!plugins/image_renderer/native/src/lib.rs
+!plugins/image_renderer/native/README.md
+!plugins/image_renderer/native/bin/
+!plugins/image_renderer/native/bin/**/.gitkeep
+!plugins/image_renderer/native/bin/**/zcbot_render.so
+!plugins/image_renderer/native/bin/**/zcbot_render.pyd
+plugins/image_renderer/native/target/
+plugins/image_renderer/native/bin_extract/
+
+# 插件数据/配置目录（仅放行 help 的插件配置）
+plugins_dat/*
+!plugins_dat/help/
+plugins_dat/help/*
+!plugins_dat/help/plugin.yaml
+
+# 本地依赖包（.whl 等，体积大且为第三方产物）
+packages/
+
+# ============================================================
+# 敏感配置（勿提交到公开仓库）
+# ============================================================
+config.yaml
+config.yaml.bak.*
+.env
+cookies.txt
+*.db
+
+# ============================================================
+# 数据文件
+# ============================================================
+data/
+
+# ============================================================
+# 日志
+# ============================================================
+logs/
+*.log
+
+# ============================================================
+# Node.js / node_modules
+# ============================================================
+node_modules/
+plugins/office_assistant/word_renderer_js/node_modules/
+
+# ============================================================
+# IDE / 编辑器
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================================================
+# 操作系统
+# ============================================================
+Thumbs.db
+.DS_Store
+
+# ============================================================
+# 插件目录（不在源码范畴，已移出项目目录）
+# ============================================================
+../zcbot_plugins/*.bak.*
+# 新增基础插件（v0.0.1-beta.1）
+!plugins/session_waiter/
+!plugins/session_waiter/**
+!plugins/message_guard/
+!plugins/message_guard/**
+!plugins/plugin_depgraph/
+!plugins/plugin_depgraph/**
+!plugins/ui_ext_demo/
+!plugins/ui_ext_demo/**
+plugins/*/__pycache__/
+plugins/*/__pycache__/**
+
+# minecraftconsole 插件（自定义插件，放行）
+!plugins/minecraftconsole/
+!plugins/minecraftconsole/**
+
+# ============================================================
+# minecraftconsole 专属：运行现场 / 备份 / 工具依赖（不入库）
+# ============================================================
+# MC 服务器运行现场（spigot jar / world / 日志，体积大且随时可变）
+mc-server/
+# 历史 jar / framework 同步备份
+_prevjar/
+_backup_*/
+# 插件 web/app 为 Vue dev 工程，node_modules 不入库（源码保留）
+plugins/minecraftconsole/web/app/node_modules/
+
+# vite 构建临时文件
+*.timestamp-*.mjs
+
+# 兜底：任何层级的 __pycache__ 都不入库（含被 !plugins/minecraftconsole/** 放行的目录）
+plugins/minecraftconsole/__pycache__/
