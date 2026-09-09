@@ -90,6 +90,11 @@ Thumbs.db
 .DS_Store
 
 # ============================================================
+# WorkBuddy 项目数据（非源码，勿提交）
+# ============================================================
+.workbuddy/
+
+# ============================================================
 # 插件目录（不在源码范畴，已移出项目目录）
 # ============================================================
 ../zcbot_plugins/*.bak.*
@@ -104,24 +109,3 @@ Thumbs.db
 !plugins/ui_ext_demo/**
 plugins/*/__pycache__/
 plugins/*/__pycache__/**
-
-# minecraftconsole 插件（自定义插件，放行）
-!plugins/minecraftconsole/
-!plugins/minecraftconsole/**
-
-# ============================================================
-# minecraftconsole 专属：运行现场 / 备份 / 工具依赖（不入库）
-# ============================================================
-# MC 服务器运行现场（spigot jar / world / 日志，体积大且随时可变）
-mc-server/
-# 历史 jar / framework 同步备份
-_prevjar/
-_backup_*/
-# 插件 web/app 为 Vue dev 工程，node_modules 不入库（源码保留）
-plugins/minecraftconsole/web/app/node_modules/
-
-# vite 构建临时文件
-*.timestamp-*.mjs
-
-# 兜底：任何层级的 __pycache__ 都不入库（含被 !plugins/minecraftconsole/** 放行的目录）
-plugins/minecraftconsole/__pycache__/

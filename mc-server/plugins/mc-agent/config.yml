@@ -1,0 +1,7 @@
+# mc-agent 配置：连接 minecraftconsole（ZCBOT 侧）
+# 需与 minecraftconsole 插件保持相同的 secret 与端口
+host: 127.0.0.1        # 控制器地址（FRP 转发后的内网目标）
+port: 25599            # 控制器 TCP 协议端口
+secret: "zcboot-mc-please-change-me"
+interval-ms: 1000      # 心跳周期（毫秒）
+reconnect-ms: 3000     # 断线重连间隔（毫秒）
