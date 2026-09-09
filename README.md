@@ -1,517 +1,371 @@
-# ZCBOT
+# MinecraftConsole · Minecraft 服务器远程控制台
 
-> 一个通用的插件化聊天机器人框架。核心极简，所有功能按需加载——支持 OneBot（QQ）、WebUI 管理面板、HTTP API、定时任务、权限系统等。
-> 内置 AI 助手，不会写代码也能用聊天的方式开发插件。
+> 在**网页**或 **QQ** 上远程管理 Minecraft（Java 版）服务器：看 TPS / 在线人数、下发服务器命令并拿到真实执行输出、实时日志、拖拽式自动化工作流、玩家绑定、远程文件管理。
+>
+> 它由两部分组成，缺一不可：
+> - **控制器**（本仓库 Python 侧，`plugins/minecraftconsole`）：你在浏览器 / QQ 操作的控制台，负责发命令、收结果、跑工作流、存日志
+> - **mc-agent**（`mc-agent-java`，一个 Bukkit 插件）：装进你的 MC 服务器，连上控制器，真正在服务器里执行命令并回传结果
+>
+> 两者用一条轻量私有 TCP 协议通信，可以本机直连，也可以经 FRP 等内网隧道跨网控制异地服务器。
 
-**当前版本：v1.3.0**
-
-📚 项目地址：https://github.com/kuangxing6367/zcbot
-💬 反馈交流：QQ 群 **1060129201**
+**版本：v1.0.0-beat.0**（见 `VERSION`）　仓库：https://github.com/kuangxing6367/zcbot-minecraftconsole
 
 ---
 
-## 一、架构总览
+## 目录
+
+1. [功能](#一功能)
+2. [架构与一条命令的流程](#二架构与一条命令的流程)
+3. [快速开始](#三快速开始)
+4. [网页面板导览](#四网页面板导览)
+5. [自动化工作流](#五自动化工作流)
+6. [用 QQ 管服：命令与玩家绑定](#六用-qq-管服命令与玩家绑定)
+7. [通信协议与 agent 指令](#七通信协议与-agent-指令)
+8. [控制台接口](#八控制台接口)
+9. [配置项](#九配置项)
+10. [常见问题](#十常见问题)
+
+---
+
+## 一、功能
+
+### 网页控制台
+
+- **状态总览**：实时显示在线 / 离线、TPS、在线人数、最近心跳时间；心跳历史落库并画趋势图；**6 秒**收不到服务器心跳即判定离线
+- **命令台**：像在服务器控制台一样输入命令（`list`、`give`、`say`、`op`……vanilla 和插件命令都支持），返回服务器真实执行输出
+- **实时日志**：SSE 推送连接、命令、回执、离线告警等全部事件，打开页面自动回放最近日志
+- **文件管理**：直接浏览 / 编辑 / 上传 / 下载 / 重命名 / 删除 MC 服务器文件（服务器在远端时经 agent 操作，在本机时直接操作）
+
+### 自动化工作流
+
+- 拖拽编排 `触发 → 动作 → 条件分支 → 结束` 流程，实现「收到某句话就自动查在线列表 / 执行一串命令 / 按输出结果分支处理」
+- 网页可手动测试运行；QQ 聊天里发对应关键词即可触发，支持把发言者绑定的游戏名自动代入命令
+- 详见[第五节](#五自动化工作流)
+
+### 用 QQ 管服（可选入口）
+
+- 接上 QQ 机器人后，在群里 / 私聊发命令查状态、触发工作流
+- QQ 号与 MC 游戏 ID **按群绑定**，工作流可自动代入「是谁在操作、对应哪个游戏玩家」
+- 详见[第六节](#六用-qq-管服命令与玩家绑定)
+
+### 服务器查询指令（QUERY）
+
+除了普通 MC 命令，agent 还内置一组只读查询：在线玩家、指定玩家资料 / 坐标、离线玩家记录、世界列表与信息、指定坐标方块、半径内实体清单，供工作流直接调用，详见[第七节](#七通信协议与-agent-指令)。
+
+### 安全与审计
+
+- 控制器与 agent 之间用 HMAC 令牌 + 3 秒时间窗 + 单调序号防伪造 / 防重放
+- 每条下发的命令都留审计记录（操作人、命令、时间、心跳历史、玩家绑定分别入库）
+
+---
+
+## 二、架构与一条命令的流程
 
 ```
-┌─────────────────────────────────────────────────┐
-│            Core Framework（极简壳）               │
-│  • 插件加载器  • 事件总线  • 消息路由  • ctx     │
-└──────────────────────┬──────────────────────────┘
-                       │ 加载
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ onebot_adapter│ │ webui       │ │ session      │
-│ (可选)       │ │ (可选)       │ │ (可选)       │
-└──────────────┘ └──────────────┘ └──────────────┘
-        │              │              │
-        ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│  http_api    │ │  scheduler   │ │   perm       │
-│ (可选)       │ │ (可选)       │ │ (可选)       │
-└──────────────┘ └──────────────┘ └──────────────┘
-                       │
-                       ▼
-                ┌──────────────┐
-                │ plugins/     │
-                │ 用户插件      │
-                └──────────────┘
+  浏览器（控制台面板）            QQ（可选入口）
+        │ 8080 / 25598               │ 6830
+        ▼                            ▼
+┌────────────────────────────────────────────┐
+│ 控制器（python main.py · plugins/minecraftconsole）│
+│  面板 / 工作流引擎 / 玩家绑定 / 命令审计 / 日志      │
+│  TCP 服务 :25599                           │
+└───────────────────┬────────────────────────┘
+                    │ 心跳帧 / 命令帧 / 回执帧（HMAC 校验）
+                    │ 本机直连或经 FRP 隧道
+                    ▼
+┌────────────────────────────────────────────┐
+│ 你的 Minecraft 服务器（Bukkit/Spigot/Paper，1.12+）│
+│  plugins/mc-agent.jar（Java 8）             │
+│   收命令 → 主线程以控制台身份执行 → 回传输出   │
+└────────────────────────────────────────────┘
 ```
 
-**核心理念**：框架 = 壳 + 官方插件集 + 用户插件
+**一条命令怎么走完**：
 
-- **核心壳**：极简的插件加载器和事件总线，不实现任何具体功能
-- **官方插件**：框架开发者提供的基础能力（OneBot适配、WebUI、会话、调度、HTTP API、权限……）
-- **用户插件**：用户自己的业务逻辑
-
----
-
-## 二、它是干嘛的？
-
-ZCBOT 是一个**插件化聊天机器人框架**。你需要什么功能，就加载什么插件；没有的需求，一个都不装。
-
-核心能力：
-
-- **协议适配**：通过 OneBot 客户端连接 QQ（NapCat / Lagrange / go-cqhttp 等）
-- **Web 管理面板**：可视化管理插件、用户、群组、权限、定时任务
-- **HTTP API**：外部程序通过 REST 接口与框架交互
-- **定时任务**：cron 表达式或固定间隔执行
-- **权限系统**：LuckPerms 风格，节点 + 继承 + 上下文
-- **数据库**：SQLite 零配置 / MySQL 可选，自动建表
-- **AI 助手**：内置 AI 插件，用聊天方式开发插件
+1. 你在面板输入 `list`（或 QQ 消息命中某工作流）
+2. 控制器先过工作流匹配，再校验操作权限，然后把命令封进**命令帧**（带 HMAC 令牌、时间戳、序号）发给在线 agent
+3. agent 校验通过后回到服务器**主线程**执行；普通命令在约 300ms 后读取 `logs/latest.log` 的新增行作为输出
+4. agent 用**回执帧**把输出回传，控制器推给面板 / QQ；工作流的条件节点能基于这份真实输出决定下一步
+5. 全程写命令审计与日志缓冲
 
 ---
 
-## 三、官方插件（可选加载）
+## 三、快速开始
 
-在 `config.yaml` 中控制：
+### 1. 启动控制器
+
+需要 **Python 3.10+**：
+
+```bash
+pip install -r requirements.txt   # 缺依赖时启动也会自动补装
+python main.py                    # Linux 也可 bash start.sh
+```
+
+首次启动自动生成 `config.yaml` 与 `data/` 数据目录。
+
+### 2. 登录面板
+
+浏览器打开 `http://localhost:8080`，默认账号 `admin` / 密码 `admin123`（**上线前请改密码**）。打开后默认进入 MC 控制台面板。
+
+### 3. 构建 mc-agent
+
+需要 **JDK 8+** 与 Maven（agent 兼容 **MC 1.12+ / Java 8** 的老服务器）：
+
+```bash
+cd mc-agent-java
+mvn clean package        # 产物 target/mc-agent.jar
+```
+
+### 4. 装进 MC 服务器并对接
+
+把 `mc-agent.jar` 放进服务器 `plugins/`，重启一次生成配置，编辑 `plugins/mc-agent/config.yml`：
 
 ```yaml
-core_plugins:
-  onebot_adapter: true    # OneBot 11 协议适配器
-  webui: true             # Web 管理后台
-  session: true           # 多轮会话管理器
-  scheduler: true         # 定时任务调度器
-  http_api: false         # HTTP REST API（默认关闭）
+host: 127.0.0.1                       # 控制器地址；服务器在异地就填 FRP 转发后的地址
+port: 25599                           # 与控制器 tcp_port 一致
+secret: "zcboot-mc-please-change-me"  # 与控制器 secret 一致，务必改掉默认值
+interval-ms: 1000                     # 心跳周期
+reconnect-ms: 3000                    # 断线重连间隔
+fs:
+  enabled: true                       # 允许远程文件操作
+  read-only: false                    # true = 只允许读
+  allow-absolute-paths: false         # 是否允许访问服务器目录之外的绝对路径
+  max-read-bytes: 262144              # 单次读文件上限（字节）
 ```
 
-| 官方插件 | 功能 | 默认 |
-|---------|------|------|
-| `onebot_adapter` | OneBot 11 WebSocket 连接 + API 调用 | 启用 |
-| `webui` | Web 管理面板 + REST API | 启用 |
-| `session` | 内置多轮会话（`ctx.wait_for()`） | 启用 |
-| `scheduler` | APScheduler 定时任务 | 启用 |
-| `http_api` | 独立 HTTP API 服务（供外部程序调用） | 关闭 |
-| `image_renderer` | 图片渲染引擎（Rust 原生扩展 + PIL 回退） | 启用 |
+再重启服务器。两端 `secret` 或端口不一致时，面板会一直显示离线、日志里出现 `bad-token`。面板看到「agent 接入」并周期性刷新 TPS / 人数，即对接成功。
 
-**不需要 QQ 功能？** 设 `core_plugins.onebot_adapter: false`，整个 WS 长连接不加载。
+### 5.（可选）用 QQ 管服
 
-**不需要 WebUI？** 设 `core_plugins.webui: false`，Flask 服务不启动。
+启动一个 OneBot 11 客户端（NapCat / Lagrange / go-cqhttp），反向 WebSocket 连到 `ws://127.0.0.1:6830`，Access Token 与 `config.yaml → onebot.access_token` 保持一致即可。不需要 QQ 入口可跳过。
 
----
+### 6.（可选）本机服务端目录
 
-## 四、多轮会话（内置）
-
-```python
-async def handle_survey(event, match):
-    # 简单用法：等待用户回复
-    name = await ctx.wait_for(event, prompt="你叫什么名字？", timeout=60)
-    if name is None:
-        await ctx.asend_msg(..., message="超时了")
-        return
-    
-    age = await ctx.wait_for(event, prompt="年龄？", timeout=60)
-    await ctx.asend_msg(..., message=f"{name}, {age}岁")
-
-# 高级用法：会话对象
-async def handle_quiz(event, match):
-    async with ctx.create_session(event, timeout=120) as sess:
-        q1 = await sess.ask("1+1=?")
-        sess.data['q1'] = q1
-        q2 = await sess.ask("2+2=?")
-        sess.data['q2'] = q2
-```
-
----
-
-## 二、快速开始（跟着做，大约 5 分钟）
-
-> 全程要敲的命令很少，复制粘贴就行。
-
-### 第 1 步：装 Python
-
-```bash
-python --version   # 需要 3.10 或更高
-```
-
-### 第 2 步：下载代码 + 装依赖
-
-```bash
-git clone https://github.com/kuangxing6367/zcbot.git
-cd zcbot
-pip install -r requirements.txt
-```
-
-> 依赖缺了不用慌，启动时框架会自动补装。
-
-### 第 3 步：启动框架
-
-```bash
-python main.py
-```
-
-看到 `框架启动完成，等待消息...` 就成功了。
-
-### 第 4 步：打开 Web 管理面板
-
-浏览器打开 `http://localhost:8080`，默认账号：
-
-- 账号：`admin`
-- 密码：`admin123`
-
-⚠️ 上线前记得改掉默认密码！
-
-### 第 5 步：连接 QQ（可选）
-
-如果需要连接 QQ，启动一个 OneBot 客户端（NapCat / Lagrange / go-cqhttp），配置反向 WebSocket：
-
-| 设置项 | 填什么 |
-| ------ | ------ |
-| 连接地址 | `ws://127.0.0.1:6830` |
-| Access Token | `config.yaml` 里的 `onebot.access_token` |
-
----
-
-到这里，框架已经能用了。下面是"怎么玩"。
-
----
-
-## 三、常见玩法
-
-### 1️⃣ 测试一下
-
-在终端或 QQ 里发：
-
-```
-/echo 你好
-```
-
-框架会回复"你好"。
-
-### 2️⃣ 和机器人聊天（接上大模型）
-
-在后台插件配置里填上大模型的地址和密钥，然后 @机器人 或发 `/chat` 就能聊天。支持长期记忆、人格设定、自动 @ 回复。
-
-### 3️⃣ 想要 AI 帮你写插件？
-
-内置了 AI 助手插件（`llm_plugin_gen`），**想要什么功能，直接跟机器人聊天，它帮你把插件写好并装上**。全程不用碰代码。
-
----
-
-## 四、我要自己写插件怎么办？
-
-文档里专门有一篇**手把手教程**，从建文件夹开始带你写第一个插件。
-
-> 📖 [编写插件](docs/guide/writing-plugins.md)（推荐，从零开始）
-> 📖 [开始使用](docs/guide/getting-started.md)（精简版）
-
-一个插件就是一个文件夹，里面有：
-
-- `__plugin_meta__`：插件的"身份证"（名字、版本、简介）
-- `register(ctx)`：告诉框架"我有哪些命令"
-
-写完把文件夹放进 `plugins/` 目录，在后台点"重载"就能用。
-
-### 在插件里做权限控制
-
-框架内置一套 LuckPerms 风格的权限组系统（见[第七节](#七权限系统luckperms-风格)）。在命令里用 `require_perm` 声明所需权限节点即可，框架会自动拦截无权限用户：
-
-```python
-@ctx.command("ban", require_perm="myplugin.ban", help="封禁用户")
-def ban(ev):
-    ...
-```
-
-也可以在 handler 内部手动判断（拿到三态结果：`True` 授予 / `False` 显式否决 / `None` 未定义）：
-
-```python
-if ev.has_perm("myplugin.ban"):       # 未定义按拒绝
-    ...
-if ev.check_perm("myplugin.ban") is False:   # 显式否决
-    ...
-```
-
----
-
-## 五、内置插件一览
-
-| 插件 | 作用 |
-| ---- | ---- |
-| **echo** | `/echo 内容` 原样返回，测试用 |
-| **help** | `/help` 生成图片帮助菜单 |
-| **image_renderer** | 通用图片渲染引擎（生成卡片、文字图） |
-| **runtime_status** | `/status` `/info` 查看运行状态（带图片版状态卡） |
-| **restart_manager** | 框架重启管理 |
-| **message_guard** | 消息防护（防刷屏、限流、敏感词） |
-| **plugin_depgraph** | 插件依赖关系扫描 |
-| **session_waiter** | 多轮会话基础设施（`wait_for_user`） |
-| **ui_ext_demo** | 网页后台扩展演示（列表 + 详情面板） |
-
-> 还想要 AI 对话、群管理、签到积分、视频解析这些功能？把 `config.yaml` 的 `plugin.dir` 指向官方插件源仓库（`kuangxing6367/zcbot_plugins`），就有 20+ 个现成插件可用：
+当 MC 服务器就跑在控制器这台机器上时，「本地文件管理」默认操作 `mc-server/` 目录；你的服务端在别处就在 `config.yaml` 指定：
 
 ```yaml
-plugin:
-  dir: ../zcbot_plugins/plugins
+minecraftconsole:
+  mc_root: D:/minecraft/server
 ```
 
-常用官方插件：
+---
 
-| 插件 | 作用 | 怎么用 |
+## 四、网页面板导览
+
+8080 根路径被 MC 控制台接管，包含以下页面（侧边栏「🎮 MC控制台」「🔀 MC工作流」）：
+
+| 页面 | 干什么 |
+| ---- | ------ |
+| 控制台（panel） | 在线状态与 TPS / 人数、命令输入框、SSE 实时日志、心跳趋势 |
+| 工作流（workflow） | 可视化新建 / 编辑 / 启停 / 测试运行自动化流程 |
+| 文件管理 | 远端文件（经 agent，需服务器在线）与本机服务端文件（lfs）的浏览编辑 |
+| 框架后台（`/index.html`） | 承载本面板的底层后台，改密码、权限、插件配置等在这；面板内有入口 |
+
+> 若 `/index.html` 打不开，是缺少底层后台的前端构建产物，不影响 MC 控制台本身使用；需要的话到 `webui/` 执行 `npm install && npm run build`。
+
+---
+
+## 五、自动化工作流
+
+工作流 = 「收到某句指令 → 自动按图执行一串服务器操作 → 把结果发回来」，数据保存在 `data/plugins_dat/minecraftconsole/workflows.json`，在「MC工作流」页拖拽编排。
+
+### 节点
+
+| 节点 | 配置 | 行为 |
 | ---- | ---- | ---- |
-| **llm_chat** | 接入大模型，@机器人 或 `/chat` 就能聊天 | `/chat 你好`、@机器人 |
-| **llm_plugin_gen** | AI 帮你写插件，描述需求即可 | `/ai 帮我写个签到插件` |
-| **qqadmin** | 群管理全套（禁言、踢人、撤回、审批、违禁词、宵禁） | `禁言 @张三 10`、`设置禁词 广告` |
-| **fun_score** | 签到积分、排行榜 | `签到`、`我的积分`、`排行榜` |
-| **send_like** | 点赞、自动点赞 | `/赞我`、`/自动点赞` |
-| **video_parse** | 群里发视频链接自动解析成卡片 | 直接发链接，或 `/解析` |
-| **file** | 服务器文件管理 | `/文件列表`、`/发送文件 data/x` |
-| **hitokoto** | 随机一言 | `一言` |
-| **broadcast** | 消息批量广播 | 回复消息发 `广播` |
-| **custom_ui** | 接管网页后台，换个性化主题 | 后台模板管理页下载/切换 |
-| **minecraftconsole** | MC 服务器控制台（需另行设计工作流与玩家绑定） | `mc-command say 你好` |
-| **dbcj-mcstatus** | MC 服务器状态 | `/mc状态` |
-| **plugin_memmon** | 插件内存监控 | `/mem`、`/memdiag` |
-| **llm_blacklist** | LLM 对话黑名单 | `/插件拉黑 12345` |
+| 触发 trigger | `match`、匹配方式 `prefix`前缀 / `regex`正则 | 流程入口，匹配指令文本（自动忽略开头的 `/`） |
+| 动作 action | `exec`普通命令 / `query`查询 / `fs`文件，及 `command` 内容 | 向服务器下发并等待真实输出；`{last}` 替换为上一步结果，`{player}` 替换为触发者绑定的游戏名 |
+| 条件 condition | `test`、`contains`包含 / `regex`正则，分 true / false 两条出线 | 对上一步输出做判断，走不同分支 |
+| 结束 end | `return` | 返回结果；默认拼接所有动作输出，关掉则只返回最后一步 |
 
-> 每个插件的完整命令列表和用法例子见 [📖 官方插件使用手册](https://github.com/kuangxing6367/zcbot_plugins)。
+### 规则
+
+- 从触发节点沿连线执行，条件节点按 true/false 选边；内置**防环路**（重复走到同一节点即停）与 **200 步**上限
+- 一条消息可同时命中多个工作流并发执行；每个动作默认等待服务器回执 **8 秒**
+- **触发方式**：QQ 聊天消息自动匹配（命中即接管），或网页「测试运行」（测试用模拟执行，不真正下发）
+- **结果投递**：默认回复触发人 / 所在群；可配置固定发到指定 QQ 或指定群
+- **玩家变量**：命令里用到 `{player}` 时，要求触发者先 `/绑定玩家`，否则该流程跳过并提示
+- **谁能用**：默认所有工作流对所有人开放；要限制某个流程，到「框架后台 → 权限管理」调整 `zcbot.wf.<流程id>` 节点（超管始终可用）
+
+### 流程示例（`workflows.json` 片段）
+
+```json
+{
+  "id": "online",
+  "name": "查在线",
+  "enabled": true,
+  "nodes": [
+    {"id": "t", "type": "trigger", "config": {"match": "谁在线", "match_type": "prefix"}},
+    {"id": "a", "type": "action",  "config": {"action": "query", "command": "QUERY|PLAYERLIST"}},
+    {"id": "e", "type": "end",     "config": {"return": true}}
+  ],
+  "edges": [
+    {"from": "t", "to": "a", "port": ""},
+    {"from": "a", "to": "e", "port": ""}
+  ]
+}
+```
+
+直接改了 `workflows.json` 文件后，在 QQ 发 `/mcon reload` 即重新加载，无需重启；网页保存则即时生效。
 
 ---
 
-## 六、常见问题
+## 六、用 QQ 管服：命令与玩家绑定
 
-**Q: 消息不回复？**
-A: ① 看后台或日志，确认 OneBot 客户端是否"已连接"；② 确认 `access_token` 两边填得一致；③ 确认消息是命令开头（如 `/echo`）。
+| 命令 | 谁能用 | 作用 |
+| ---- | ------ | ---- |
+| `/mcstatus`（或 `/mcstate`） | 管理员 | 查询服务器在线状态、TPS、人数、最近心跳 |
+| `/绑定玩家 <游戏ID>` | 所有人 | 把自己的 QQ 与 MC 游戏 ID 绑定（**按群隔离**，重复绑定覆盖） |
+| `/绑定玩家 <QQ> <游戏ID>` | 超管 | 代别人绑定 |
+| `/解绑玩家` | 所有人 | 解除自己在本群的绑定 |
+| `/我的玩家` | 所有人 | 查看自己在本群绑定的游戏 ID |
+| `/mcon reload` | 管理员 | 从磁盘重读工作流文件 |
 
-**Q: Web 后台打不开？**
-A: 确认 `web.host` 是 `127.0.0.1`（本机）或 `0.0.0.0`（局域网）。还是不行就重启框架看日志里有没有"端口被占用"。
-
-**Q: 改了插件代码没生效？**
-A: 到后台「插件」页点"重载"，或者重启框架。
-
-**Q: 忘了管理员密码？**
-A: 看 `data/logs/` 里的日志提示，或者删掉 `data/zcbot.db` 重新初始化（会重置所有数据，慎用！）。
-
-**Q: 内存一直涨？**
-A: 框架会自动定期释放空闲内存。持续上涨发 `/memdiag` 诊断看看。
+除这些固定命令外，**任何 QQ 消息都会先匹配工作流**，命中就按工作流执行（例如群友发「谁在线」自动回当前玩家列表）。
 
 ---
 
-## 七、权限系统（LuckPerms 风格）
+## 七、通信协议与 agent 指令
 
-框架在原有「单一 `role` 字符串」身份轴之外，平行提供一套完整的**权限节点**模型（对齐 Minecraft LuckPerms v5）。两者**并存**：既有命令仍可沿用 `require_level`，新功能推荐改用 `require_perm` 权限节点，互不冲突。
+控制器与 agent 之间是轻量私有二进制协议（大端序，设计为跑在 FRP 私有隧道里，本身无 TLS）。
 
-### 核心概念
+### 帧格式（所有帧共用 64 字节定长帧头，正文变长）
 
-- **节点 node**：`plugin.action.sub` 形式的权限字符串，三态（授予 / 显式否决 / 未定义）
-- **组 group**：一组节点的集合，带 `weight`（权重决定优先级与 primary group）
-- **继承**：组通过 `group.xxx` 节点继承另一个组 —— 继承与权限统一用节点表达
-- **上下文 context**：节点可限定只在特定环境生效
-  - `group=<群号>` / `bot=<OneBot实例名>` / `msgtype=group|private`
-  - 上下文为 NULL 表示全局生效
-- **临时**：节点可带 `expire_at`（unix 时间戳），过期自动失效（框架每小时清理）
-- **否决**：`value=0` 的同名节点优先于 `value=1`
-- **通配符**：`a.b.*` 匹配 `a.b.c`；`*` 匹配一切
+| 偏移 | 长度 | 字段 | 说明 |
+| ---- | ---- | ---- | ---- |
+| 0 | 1B | type | `0x01` 心跳 / `0x02` 命令 / `0x03` 回执 |
+| 1 | 4B | ts | 秒级时间戳 |
+| 5 | 16B | token | `HMAC-SHA256(secret, ts)` 前 16 字节 |
+| 21 | 4B | tps / 25-28：players | 上报的 TPS 与在线人数 |
+| 29 | 4B | plen | 正文长度（心跳为 0），上限 16MB |
+| 33 | 4B | seq | 命令 / 回执单调序号 |
+| 64… | 变长 | 正文 | UTF-8 指令或输出，无长度上限 |
 
-### 内置角色组（运行时虚拟注入，不入库）
+**防伪造 / 防重放三道关**：① 时间戳与本地差超过 **3 秒**丢弃；② HMAC 令牌恒定时间比对，不符丢弃；③ 序号单调，重复旧帧丢弃。两端自动处理粘包 / 拆包。
 
-框架原有的 `super / owner / admin / member` 四层身份，被映射为一条内置继承链：
+### agent 三类指令（工作流动作节点也用这套）
 
-```
-__member(w0) ← __admin(w20) ← __owner(w30) ← __super(w100)
-```
+**1. EXEC —— 普通服务器命令**
 
-每个内置组自带 `zcbot.role.{member|admin|owner|super}` 节点，因此：
+不带头前缀、直接写 MC 命令即可。agent 以控制台身份在主线程执行，约 300ms 后读取 `logs/latest.log` 新增的最多 80 行作为输出；没有输出则返回「命令已执行，无输出」。
 
-```
-require_level='admin'  ≡  检查节点 zcbot.role.admin
-```
+**2. QUERY —— 只读查询**（格式 `QUERY|<子类型>|参数`，主线程调 Bukkit API，不改变服务器）
 
-语义与原 `Event.is_admin` 完全一致，但 `Event.role` 本身无需改动。
+| 子类型 | 参数 | 返回内容 |
+| ------ | ---- | -------- |
+| `PLAYERLIST` | 无 | 在线玩家列表与数量 |
+| `PLAYER` | `<玩家>` | UUID、等级、血量、饱食、游戏模式、IP、世界与坐标（支持前缀模糊匹配） |
+| `OFFLINE` | `<玩家>` | 是否玩过、是否被封、最后上线时间 |
+| `WORLDLIST` | 无 | 所有世界及各世界人数 |
+| `WORLD` | `<世界名>` | 类型、环境、难度、人数、实体数、种子、出生点 |
+| `BLOCK` | `<世界>\|<x>\|<y>\|<z>` | 某坐标方块类型 |
+| `NEAR` | `<世界>\|<x>\|<y>\|<z>[\|半径]` | 半径（默认 8）内实体清单，最多 30 个 |
 
-### 在网页后台管理
+**3. FS —— 服务器文件操作**（格式 `FS|<操作>|base64路径|...`，受 agent `config.yml` 的 `fs.*` 约束，默认禁止绝对路径、禁止越出服务器根目录）
 
-后台新增「**权限管理**」页面（侧边栏钥匙图标 → `/permissions`），包含 5 个标签页：
-
-| 标签页 | 功能 |
-| ------ | ---- |
-| 权限组 | 创建/编辑/删除权限组，设置权重、前缀、默认组；查看每个组的节点 |
-| 用户 | 给用户直接授予/撤销节点、加入/移出权限组（支持上下文与过期时间） |
-| 轨道 | 配置 Tracks（如 `default,vip,admin`），用于一键晋升/降级 |
-| 校验器 | 输入 QQ 号 + 上下文，实时查看其生效组与节点解析结果 |
-| 审计 | 查看所有权限变更的审计日志 |
-
-> 所有变更都会写入 `perm_audit` 审计表，可在「审计」标签页回溯。
-
-### 节点命名约定（推荐）
-
-| 前缀 | 含义 | 示例 |
-| ---- | ---- | ---- |
-| `插件名.动作.子项` | 插件自定义权限 | `myplugin.ban`、`myplugin.config.set` |
-| `zcbot.role.*` | 框架内置身份 | `zcbot.role.admin` |
-| `zcbot.wf.*` | 工作流权限（下游项目用） | `zcbot.wf.mc_command` |
-
-默认权限组带 `zcbot.wf.*` 通配，新工作流默认对所有用户开放；如需收紧，移除该通配并改用显式节点。
-
----
-
-## 八、接口令牌（API Key）
-
-框架原先只有「用户登录会话 token」（2048 字符，存于 `admin_users`，随登录/登出轮换、受 `web.session_timeout` 时效限制）。这导致**外部程序长期调用 REST API 时 token 会过期失效**。
-
-为此新增独立的**接口令牌（API Key）**系统，专供脚本/第三方服务稳定调用：
-
-- 令牌长度 64 字符（`secrets.token_hex(32)`），独立于用户会话，**不随登录轮换**
-- 存于 `api_tokens` 表，可设置**绝对过期时间**（也可永不过期）
-- 支持**吊销**（软删除：`is_active=0`），吊销立即生效
-- 创建后 **token 仅返回一次**，请妥善保存
-- 仅 `super` 角色可创建/吊销
-
-### 在网页后台创建
-
-后台新增「**接口令牌**」页面（侧边栏钥匙图标 → `/apikeys`）：填写名称、选择角色（admin/super）、可选过期时长，点击创建后 token 明文显示一次，复制保存即可；列表可随时吊销。
-
-### 调用方式
-
-在 HTTP 请求头里带 `Authorization: Bearer <token>`（与登录 token 用法完全一致，`_verify_token` 同时兼容两类令牌）：
-
-```bash
-curl -H "Authorization: Bearer <你的API_KEY>" \
-     http://127.0.0.1:8081/api/perm/groups
-```
-
-> 注意：Web 后台页面走 `web.port`（默认 8080），而 REST API 走 **8081** 端口。
-
----
-
-## 九、开发者指南（开发文档）
-
-### 9.1 项目结构
-
-```
-.
-├── main.py                 # 启动入口
-├── config.yaml             # 运行配置（首次启动自动生成）
-├── framework/              # 框架核心
-│   ├── core.py             # 框架主体、定时任务调度
-│   ├── db.py               # 数据库抽象（SQLite / MySQL55 双方言自动建表）
-│   ├── event.py            # Event 事件对象（含权限查询方法）
-│   ├── ctx.py              # PluginContext（插件可用的全部能力）
-│   ├── router.py           # 命令路由（支持 require_perm / require_level）
-│   ├── loader.py           # 插件加载器
-│   ├── apis.py             # Web 后台 + REST API（含权限/接口令牌接口）
-│   └── perm.py             # 权限引擎（LuckPerms 风格，无第三方依赖）
-├── sql/                    # 建表 SQL（init.sql / init_mysql55.sql）
-├── plugins/                # 插件代码（可 GitHub 覆盖更新）
-├── webui/                  # 前端源码（Vue 3 + Vite + Element Plus）
-├── web/                    # 前端构建产物（由 webui/ 构建而来）
-├── data/                   # 运行数据（db、日志、插件数据）
-└── docs/                   # 文档
-```
-
-### 9.2 权限系统开发接口
-
-**A. 在事件（Event）里判断**（handler 内最常用）：
-
-| 方法 | 返回 | 说明 |
-| ---- | ---- | ---- |
-| `ev.has_perm(node)` | `bool` | 是否拥有节点（未定义按拒绝） |
-| `ev.check_perm(node)` | `True/False/None` | 三态：授予 / 显式否决 / 未定义 |
-| `ev.perms` | `PermissionSet` | 完整权限快照（`.groups` / `.nodes` / `.primary_group`） |
-| `ev.perm_groups` | `list` | 生效的权限组（含继承展开，按 weight 降序） |
-| `ev.primary_group` | `str` | 权重最高的非内置权限组 |
-
-上下文自动从事件构造（`bot` / `group` / `msgtype`），无需手动传。
-
-**B. 在任意位置用 `ctx` 判断**（非事件上下文，如定时任务）：
-
-```python
-ctx.has_perm(user_id, "myplugin.ban",
-             context={"group": "123456", "msgtype": "group"}, role=ev_role)
-ctx.check_perm(user_id, "myplugin.ban", ...)   # 三态
-ctx.user_groups(user_id, context=..., role=...) # 生效组列表
-```
-
-底层全部走 `framework.perm` 模块（`resolve` / `has_perm` / `check_perm` / `user_groups` / `audit` / `create_group` / `set_group_node` / `add_user_group` / `promote` / `demote` / `cleanup_expired` 等），可直接调用实现自定义逻辑。
-
-**C. 命令级声明**（推荐，框架自动拦截）：
-
-```python
-# 与 require_level 双轨并存：两者任一满足即放行
-@ctx.command("ban", require_perm="myplugin.ban", require_level="admin")
-def ban(ev): ...
-```
-
-- `require_perm` 缺省继承框架 `commands` 表里的配置（由后台「命令管理」维护）
-- 解析优先级：① 用户直接节点 → ② 所属组（按 weight 降序）→ ③ 同来源内按精确度（精确 > 段级通配 > 全局 `*`）→ ④ 同精确度下否决优先
-
-**D. 缓存**
-
-权限解析结果有 60s TTL 缓存（`_PERM_CACHE_TTL`）；组快照缓存 10s。Web 端改动后框架自动调用 `invalidate_all()`，无需手动处理。
-
-### 9.3 接口令牌（API Key）开发接口
-
-`_verify_token(token)` 同时兼容两类令牌：
-
-1. **用户会话 token**：长度 `== 2048`，查 `admin_users`，受 `session_timeout` 限制
-2. **接口令牌**：长度 `>= 40`，查 `api_tokens`，独立有效，不受登录轮换影响
-
-所以任何已有登录校验的接口，**无需改动即可直接用 API Key 调用**。
-
-相关 REST 端点（均需 `super` 角色，除查询类由鉴权中间件统一处理）：
-
-| 方法 & 路径 | 说明 |
+| 操作 | 说明 |
 | ---- | ---- |
-| `GET /api/apikeys` | 列出全部接口令牌（不返回 token 明文） |
-| `POST /api/apikeys` | 创建令牌（参数 `name`、`role`、`expires_in` 秒；token 仅此一次返回） |
-| `POST /api/apikeys/<id>/revoke` | 吊销令牌（软删除） |
+| `READ` | 读文本文件（受 `max-read-bytes` 限制） |
+| `LIST` | 列目录（类型 / 大小 / 时间 / 名称） |
+| `EXISTS` | 判断是否存在 |
+| `WRITE` / `APPEND` | 覆盖写 / 追加（`read-only` 时拒绝） |
+| `REPLACE` | 文本替换，可选全部或第一处 |
+| `SETLINE` | 替换指定行 |
 
-### 9.4 REST API 速查（权限相关）
+---
 
-| 方法 & 路径 | 说明 |
+## 八、控制台接口
+
+### 独立控制台 API（25598，插件自带，可经 FRP 单独暴露）
+
+| 方法 & 路径 | 作用 |
 | ---- | ---- |
-| `GET /api/perm/builtins` | 内置角色组定义 |
-| `GET /api/perm/groups` / `POST /api/perm/groups` | 列出 / 创建权限组 |
-| `PUT /api/perm/groups/<name>` / `DELETE /api/perm/groups/<name>` | 更新 / 删除权限组 |
-| `GET /api/perm/groups/<name>/nodes` | 列出组节点 |
-| `POST /api/perm/groups/<name>/nodes` / `DELETE ...` | 设置 / 删除组节点（支持 context、expire_at） |
-| `GET /api/perm/users/<id>` | 用户权限快照 |
-| `POST /api/perm/users/<id>/nodes` / `DELETE ...` | 设置 / 删除用户节点 |
-| `POST /api/perm/users/<id>/groups` / `DELETE ...` | 加入 / 移出用户组 |
-| `POST /api/perm/users/<id>/track` | 沿轨道晋升/降级 |
-| `GET /api/perm/tracks` / `POST /api/perm/tracks` / `DELETE /api/perm/tracks/<name>` | 轨道管理 |
-| `POST /api/perm/check` | 校验某用户+上下文的节点 |
-| `GET /api/perm/audit` | 审计日志 |
-| `POST /api/perm/cleanup` | 手动触发过期节点清理 |
+| `GET /` | 独立控制台页 |
+| `GET /api/status` | 当前状态：online / tps / players / last_beat |
+| `POST /api/cmd` | 下发命令，body `{"command": "..."}`（走完整工作流匹配与审计） |
+| `GET /api/stream` | SSE 实时日志流（先回放最近 100 条） |
+| `GET /api/heartbeat` | 最近 1000 条心跳历史 |
 
-> 完整请求/响应字段见 [📖 API 参考](docs/api/ctx.md)。
+配置了插件项 `web_token` 时，上述接口需带 `X-MC-Token` 头或 `?token=`。
 
-### 9.5 前端构建
+### 8080 下的面板业务接口（登录后使用）
 
-后台前端源码在 `webui/`，构建产物输出到 `web/`。修改前端后需重新构建：
+| 路径 | 作用 |
+| ---- | ---- |
+| `POST /api/mc/auth/login`、`GET /api/mc/auth/me`、`POST /api/mc/auth/logout` | 面板登录 / 当前用户 / 登出 |
+| `GET/POST /api/mc/workflow`、`DELETE /api/mc/workflow/<id>`、`POST /api/mc/workflow/<id>/run` | 工作流增删改查 / 测试运行 |
+| `POST /api/mc/fs` | 经 agent 操作**远端**服务器文件 |
+| `/api/mc/lfs/list、read、download、write、mkdir、rename、delete、upload` | 操作**本机**服务端目录（写操作需管理员） |
 
-```bash
-cd webui
-npm install          # 首次需安装依赖
-npm run build        # 产物输出到 ../web/
-```
+### 控制台自身的数据表
 
-> ⚠️ 构建会清空 `web/` 下的旧产物再写入。若运行环境对批量删除有安全限制，请先手动清理 `web/{js,css,img,index.html}` 再构建，或使用允许该操作的执行方式。
-
-数据库表结构见 `sql/init.sql`（SQLite）与 `sql/init_mysql55.sql`（MySQL 5.5 兼容），框架启动时会自动建表并补齐缺失表（`_auto_create_tables`）。
+| 表 | 内容 |
+| -- | ---- |
+| `mc_commands_log` | 每条下发命令：操作人（网页为 0）、命令、时间 |
+| `mc_heartbeat_log` | TPS / 人数 / 时间，保留最近 1000 条 |
+| `mc_whitelist` | QQ ↔ 游戏 ID 绑定，按群 + QQ 唯一 |
 
 ---
 
-## 十、进阶文档
+## 九、配置项
 
-遇到看不懂的词，文档里都有解释。按下面的顺序读最顺：
+### minecraftconsole 插件配置（在「框架后台 → 插件配置」里改）
 
-- [📚 文档索引](docs/guide/README.md) — 所有文档的总目录
-- [编写插件](docs/guide/writing-plugins.md) — 从零开始写第一个插件
-- [开始使用](docs/guide/getting-started.md) — 快速上手
-- [配置系统](docs/guide/configuration.md) — 插件的设置项怎么写
-- [多轮会话](docs/guide/session.md) — 交互式对话
-- [API 参考](docs/api/ctx.md) — ctx 全部方法
-- [架构详解](docs/advanced/architecture.md) — 消息处理流程
-- [权限系统](docs/advanced/permission.md) — LuckPerms 风格权限
-- [定时任务](docs/advanced/scheduler.md) — cron/interval 定时
-- [数据库](docs/advanced/database.md) — SQLite/MySQL
-- [部署](docs/advanced/deployment.md) — 生产环境部署
-- [常见问题](docs/faq.md) — 常见坑和解决方案
+| 配置项 | 默认值 | 说明 |
+| ------ | ------ | ---- |
+| `secret` | `zcboot-mc-please-change-me`（也读环境变量 `MC_SECRET`） | 与 agent 一致的对称密钥，**必须改** |
+| `tcp_host` / `tcp_port` | `0.0.0.0` / `25599` | agent 接入监听 |
+| `api_host` / `api_port` | `0.0.0.0` / `25598` | 独立控制台 API |
+| `web_token` | 空 | 独立 API 令牌，留空不校验 |
+| `admin_ids` | 空 | 额外允许下发命令的 QQ，逗号分隔（网页操作与超管不受限） |
+| `log_ring` | `300` | 内存实时日志缓冲条数 |
+
+### `config.yaml` 中与控制台相关的项
+
+| 配置 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `web.host` / `web.port` | `127.0.0.1` / `8080` | 面板地址；局域网访问把 host 改 `0.0.0.0` |
+| `onebot.listen_port` / `onebot.access_token` | `6830` / 空 | 可选 QQ 入口，不用可不管 |
+| `minecraftconsole.mc_root` | 插件目录上两级的 `mc-server/` | 本机文件管理根目录 |
+| `database` | SQLite，`data/zcbot.db` | 零配置；要换 MySQL 改成对应连接信息即可，表自动创建 |
+
+### 端口汇总
+
+| 端口 | 用途 |
+| ---- | ---- |
+| 8080 | 网页面板 |
+| 25599 | 与 mc-agent 的 TCP 协议 |
+| 25598 | 独立控制台 API |
+| 6830 | 可选，QQ(OneBot) 反向 WS |
 
 ---
 
-## 📜 开源协议
+## 十、常见问题
 
-MIT + Apache 2.0 双协议，任选其一适用。
+**面板一直显示离线？**
+按序排查：① 服务器是否装好 `mc-agent.jar` 并完整重启；② agent 日志有没有「已连上控制器 host:port」；③ 两端 `secret`、端口（25599）是否完全一致；④ 异地时 FRP 隧道是否通；⑤ 两机系统时间差是否超过 3 秒。面板日志出现 `agent 接入` 且 TPS 周期刷新才算正常。
 
-> 本项目代码由 AI 完成为主、人工辅助完成。用着顺手的话，给个 ⭐ 吧！
+**命令发了但没输出？**
+普通命令靠 agent 读取服务器 `logs/latest.log` 的新增行，确认服务器日志正常生成、命令本身确有文本输出；`QUERY|...` 查询不走日志、直接返回。等待超过 8 秒会回 `[timeout]`，多为服务器卡顿。
+
+**日志里出现 bad-token / stale-timestamp / replay-seq？**
+`bad-token` = 两端 secret 不一致；`stale-timestamp` = 两机时钟差超过 3 秒，校时即可；`replay-seq` = 重复旧帧被正常拦截，偶发忽略，持续出现说明链路在重复投递。
+
+**QQ 里发消息没反应？**
+确认 OneBot 客户端已连上 6830、两端 token 一致；消息是否本应命中某工作流却没配触发词；`/mcstatus` 等管理命令需要管理员身份。
+
+**改了工作流不生效？**
+网页保存即时生效；直接编辑 `workflows.json` 后发 `/mcon reload`。
+
+**忘了面板密码？**
+删除 `data/zcbot.db` 会重新初始化（**会清空控制台全部数据，慎用**）。
+
+---
+
+## 附：服务器侧 agent
+
+agent 的构建、帧格式与线程模型细节见 [mc-agent-java/README.md](mc-agent-java/README.md)。
+
+## 开源协议
+
+MIT + Apache 2.0 双协议，任选其一，文本见 [LICENSE](LICENSE)。

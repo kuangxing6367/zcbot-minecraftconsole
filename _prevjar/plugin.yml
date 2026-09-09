@@ -1,8 +1,0 @@
-# 注意：Bukkit 校验插件名只允许 ASCII（^[A-Za-z0-9 _.-]+$），
-# 中文名放在 jar 文件名上（zc_mc_控制台插件.jar）
-name: zc_mc_console
-version: '1.0'
-main: h_aaa.astrbotrconbridge.AstrBotRconBridge
-api-version: 1.16
-authors: [H_aaa]
-description: zc_mc_控制台插件 - AstrBot MC 控制台桥接

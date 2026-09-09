@@ -16,6 +16,11 @@ plugins/*
 !plugins/echo/
 !plugins/echo/main.py
 !plugins/echo/requirements.txt
+# 核心插件：Minecraft 控制台（控制器主体，必须完整放行）
+!plugins/minecraftconsole/
+!plugins/minecraftconsole/**
+plugins/minecraftconsole/**/node_modules/
+plugins/minecraftconsole/**/__pycache__/
 !plugins/help/
 !plugins/help/main.py
 !plugins/help/draw.py
