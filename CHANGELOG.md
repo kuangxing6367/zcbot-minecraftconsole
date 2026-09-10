@@ -1,13 +1,13 @@
 # 更新日志
 
-## v1.0.0-beat.0
+## v1.0.0-beta.0
 
 ### 变更
 
 - 项目定型为 Minecraft 服务器远程控制台（Python 控制器 + 服务器侧 mc-agent），README 重写并聚焦控制台：快速开始、网页面板、自动化工作流、私有通信协议与 EXEC/QUERY/FS 指令、配置与排障
 - 移除内置演示/辅助业务插件、内置 mc-server 与框架前端构建产物（历史保留在 git）
 - `.gitignore` 补全 minecraftconsole 核心插件白名单，避免其新增文件被漏提交
-- 版本号重置为 v1.0.0-beat.0
+- 版本号重置为 v1.0.0-beta.0
 
 ---
 

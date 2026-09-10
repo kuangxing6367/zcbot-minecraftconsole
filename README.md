@@ -8,7 +8,7 @@
 >
 > 两者用一条轻量私有 TCP 协议通信，可以本机直连，也可以经 FRP 等内网隧道跨网控制异地服务器。
 
-**版本：v1.0.0-beat.0**（见 `VERSION`）　仓库：https://github.com/kuangxing6367/zcbot-minecraftconsole
+**版本：v1.0.0-beta.0**（见 `VERSION`）　仓库：https://github.com/kuangxing6367/zcbot-minecraftconsole
 
 ---
 
