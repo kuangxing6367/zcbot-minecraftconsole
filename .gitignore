@@ -114,3 +114,6 @@ Thumbs.db
 !plugins/ui_ext_demo/**
 plugins/*/__pycache__/
 plugins/*/__pycache__/**
+
+# Java 构建产物
+mc-agent-java/target/

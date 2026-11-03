@@ -11,7 +11,7 @@ import java.util.Arrays;
  * 与 minecraftconsole (Python) 端一致的可变长二进制帧编解码 + 安全校验。
  *
  * 帧格式（大端序，所有帧共用 64B 基础头，载荷变长、无 384 上限）：
- *   offset 0     : type (1B)  0x01 心跳 / 0x02 命令(EXEC/QUERY/FS 指令文本) / 0x03 回执
+ *   offset 0     : type (1B)  0x01 心跳 / 0x02 命令(EXEC/QUERY/FS 指令文本) / 0x03 回执 / 0x04 控制台日志
  *   offset 1-4   : ts (4B)   时间戳
  *   offset 5-20  : token (16B) HMAC-SHA256(secret, ts4) 前16字节
  *   offset 21-24 : tps (4B float)
@@ -30,6 +30,7 @@ public final class FrameCodec {
     public static final int HEARTBEAT_TYPE = 0x01;
     public static final int COMMAND_TYPE  = 0x02;
     public static final int OUTPUT_TYPE   = 0x03;
+    public static final int LOG_TYPE      = 0x04;
     public static final int HEARTBEAT_LEN = 64;
     public static final int HEADER_LEN    = 64;
     public static final int PLEN_OFF      = 29;
@@ -90,6 +91,20 @@ public final class FrameCodec {
         byte[] body = text.getBytes(StandardCharsets.UTF_8);
         byte[] f = new byte[HEADER_LEN + body.length];
         fillHeader(f, OUTPUT_TYPE, ts, tps, players);
+        System.arraycopy(ByteBuffer.allocate(4).putInt(body.length).array(), 0, f, PLEN_OFF, 4);
+        System.arraycopy(ByteBuffer.allocate(4).putInt(seq).array(), 0, f, SEQ_OFF, 4);
+        System.arraycopy(body, 0, f, HEADER_LEN, body.length);
+        return f;
+    }
+
+    /**
+     * 控制台日志帧 = 64B 头 + 变长日志文本（多行用 \n 连接，一条帧带一批）。
+     * seq 走独立的日志序号空间，与回执序号互不干扰。
+     */
+    public byte[] packLog(int ts, int seq, float tps, int players, String text) {
+        byte[] body = text.getBytes(StandardCharsets.UTF_8);
+        byte[] f = new byte[HEADER_LEN + body.length];
+        fillHeader(f, LOG_TYPE, ts, tps, players);
         System.arraycopy(ByteBuffer.allocate(4).putInt(body.length).array(), 0, f, PLEN_OFF, 4);
         System.arraycopy(ByteBuffer.allocate(4).putInt(seq).array(), 0, f, SEQ_OFF, 4);
         System.arraycopy(body, 0, f, HEADER_LEN, body.length);

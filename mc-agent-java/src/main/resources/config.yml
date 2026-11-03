@@ -1,14 +1,29 @@
 # mc-agent 配置：连接 minecraftconsole（ZCBOT 侧）
 # 需与 minecraftconsole 插件保持相同的 secret 与端口
 host: 127.0.0.1        # 控制器地址（FRP 转发后的内网目标）
-port: 25599            # 控制器 TCP 协议端口
+port: 25599            # 控制器 TCP 协议端口（控制通道：下发命令 + 回收执）
+console-log: true    # 是否把服务器控制台日志实时转发到控制台终端
+beat-port: 25600       # 仅 frp-enabled=false 时生效：心跳专线 TCP 端口。填 0 则心跳退回控制通道
 secret: "zcboot-mc-please-change-me"
 interval-ms: 1000      # 心跳周期（毫秒）
 reconnect-ms: 3000     # 断线重连间隔（毫秒）
 
-# 文件操作 FS（指令 FS|READ|LIST|EXISTS|WRITE|APPEND|REPLACE|SETLINE，路径 base64）
+# ── FRP 心跳（专用 UDP，国内低延迟）──
+# 心跳不再走 TCP 专线，而是把 64B 心跳以 UDP 发给下面 URL 返回的节点清单（每节点 host:port）。
+# 路径：agent → frp 公共 UDP 入口 → 139:4094 → 82:25600 控制器 UDP 入口。
+# 节点清单每小时自动拉一次（格式固定 {"nodes":[{"host":"...","port":12345}]}）。
+frp-enabled: true
+frp-nodes-url: "https://api.zgric.top/frp_nodes.json"
+frp-beat-ms: 2500     # 心跳周期（毫秒），轮询单节点发送，总速率=60000/该值 包/分钟。
+                      # 控制器按「收到包的源 IP」每 60s 限 30 包：若 139→82 转发没保留 frp 节点源 IP
+                      #（所有包都算 139 一个 IP），这个值必须 ≥2000 才不超限；默认 2500 留余量。
+                      # 调小=心跳更密但更易触发限速；调大=更省但保活更慢。
+
+# 文件操作 FS（路径与内容 base64）：
+#   读  READ / LIST / EXISTS / STAT / DOWNLOAD（分块，二进制安全）
+#   写  WRITE / APPEND / REPLACE / SETLINE / DELETE / MOVE(RENAME) / COPY / MKDIR / TOUCH
 fs:
   enabled: true
-  read-only: false            # true 时禁止 WRITE/APPEND/REPLACE/SETLINE
+  read-only: false            # true 时禁止全部写操作（含 DELETE/MOVE/COPY/MKDIR/TOUCH）
   allow-absolute-paths: false # true 才允许读写服务器根目录之外的绝对路径
-  max-read-bytes: 262144      # 单次 READ 上限（字节）
+  max-read-bytes: 262144      # 单次 READ / DOWNLOAD 分块上限（字节）

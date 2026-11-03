@@ -14,9 +14,15 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -34,7 +40,8 @@ import java.util.logging.Level;
  * mc-agent —— minecraftconsole 服务器侧插件。
  *
  * 职责：
- *  - 通过 FRP 连到 minecraftconsole 控制器 TCP 端口；周期上报 64B 心跳；
+ *  - 通过 FRP 连到 minecraftconsole 控制器 TCP 端口（控制通道：命令 / 回执）；
+ *  - 心跳走专用 FRP UDP 节点（国内低延迟）：每 frp-beat-ms 轮询向节点清单里一个节点发 64B 心跳；
  *  - 接收变长命令帧(EXEC/QUERY/FS 指令文本)，校验后：
  *      EXEC        在服务器控制台执行 MC 命令
  *      QUERY|...   查询玩家/世界/方块/附近实体（主线程 Bukkit API）
@@ -51,12 +58,29 @@ public final class MCAgent extends JavaPlugin {
     private FrameCodec codec;
     private volatile boolean running = false;
     private Thread netThread;
+    private Thread beatThread;
 
-    // 回执序号 + 写锁（网络线程心跳 与 回执新线程 共用，防帧交错）
+    // 回执序号 + 写锁（回执彼此之间共用，防帧交错）。
+    // 心跳迁到专线后不再参与这把锁 —— 大回执（最大 256KB）不会再把它挡在后面。
     private final AtomicInteger outSeq = new AtomicInteger(1);
     private final Object writeLock = new Object();
-    // 由网络线程持有并写，回执线程经锁写
+    // 由网络线程（控制通道）持有并写，回执线程经锁写
     private volatile OutputStream netOut;
+
+    // 心跳专线：独立一条 TCP 只发 64B 心跳，与控制通道互不干扰。
+    // beatOut==null / beatDedicated==false 时心跳自动退回控制通道（老控制器或专线不通时的降级）。
+    private volatile OutputStream beatOut;
+    private volatile boolean beatDedicated = false;
+
+    // 控制台日志转发：有界队列 + 独立发送线程。
+    // 日志是服务器线程产出的，绝不能让它等 socket —— offer 进队列（满就丢），
+    // 发送线程按批合并成一条帧发出去，几十行日志也只有一个帧头开销。
+    private final java.util.concurrent.BlockingQueue<String> logQueue =
+            new java.util.concurrent.LinkedBlockingQueue<String>(500);
+    private final AtomicInteger logSeq = new AtomicInteger(1);
+    private Thread logThread;
+    private static final int LOG_BATCH = 40;        // 一条帧最多合并多少行
+    private static final int LOG_LINE_MAX = 500;    // 单行截断长度（防一条超长日志吃满帧）
 
     private volatile float currentTps = 20.0f;
     private volatile int currentPlayers = 0;
@@ -67,8 +91,30 @@ public final class MCAgent extends JavaPlugin {
 
     private String host;
     private int port;
+    private int beatPort;      // 心跳专线端口；<=0 表示不用专线（心跳全走控制通道）
     private long intervalMs;
+
+    /** 控制通道活性探测间隔：即便心跳专线通着，也按这个节奏在控制通道补一拍心跳。
+     *  它不为报数，只为让「这条通道还活着」有信号，并换来控制器的一拍 ACK ——
+     *  有了 ACK，本端 read 才有数据流，「静默判死」才成立。 */
+    private static final long CTRL_PROBE_MS = 15000;
+
+    /** 控制通道静默判死阈值：连续这么久一个字节都没读到，判定链路已断（典型是 TCP 半开）。 */
+    private static final long CTRL_IDLE_MS = 45000;
     private long reconnectMs;
+
+    // ── FRP 心跳（专用 UDP，国内低延迟）──
+    // 心跳不走控制通道的 TCP，也不直连控制器本身；改为把 64B 心跳以 UDP 发给 frp_nodes.json
+    // 里的节点（agent → frp 公共 UDP 入口 → 139:4094 → 82:25600 控制器 UDP 入口）。
+    // 节点清单每小时从 frp-nodes-url 拉一次；frpNodes 为空时心跳线程只空转、绝不报错崩线程。
+    private boolean frpEnabled = true;
+    private String frpNodesUrl = "https://api.zgric.top/frp_nodes.json";
+    private long frpBeatMs = 2500;                  // 心跳周期（毫秒）。轮询单节点发送，总速率 = 60000/frpBeatMs；
+                                                     // 务必 ≤30000，否则触发控制器每 IP 30 包/分钟限速
+    private volatile java.util.List<InetSocketAddress> frpNodes =
+            new java.util.ArrayList<InetSocketAddress>();
+    private int frpRotate = 0;                       // 轮询下标：每个周期只发一个节点，下个周期换下一个
+    private volatile long lastFrpHint = 0;          // 最近一次成功发出 frp 心跳的时间（调试用）
 
     // FS 配置
     private boolean fsEnabled = true;
@@ -82,8 +128,13 @@ public final class MCAgent extends JavaPlugin {
         FileConfiguration c = getConfig();
         host = c.getString("host", "127.0.0.1");
         port = c.getInt("port", 25599);
+        beatPort = c.getInt("beat-port", 25600);
         intervalMs = c.getLong("interval-ms", 1000);
         reconnectMs = c.getLong("reconnect-ms", 3000);
+        frpEnabled = c.getBoolean("frp-enabled", true);
+        frpNodesUrl = c.getString("frp-nodes-url", "https://api.zgric.top/frp_nodes.json");
+        long fb = c.getLong("frp-beat-ms", 2000);
+        frpBeatMs = fb < 1000 ? 1000 : fb;          // 兜底：太猛会触发控制器每 IP 30 包/分钟限速
         String secret = c.getString("secret", "zcboot-mc-please-change-me");
         fsEnabled = c.getBoolean("fs.enabled", true);
         fsReadOnly = c.getBoolean("fs.read-only", false);
@@ -99,7 +150,30 @@ public final class MCAgent extends JavaPlugin {
         netThread = new Thread(this::runLoop, "mc-agent-net");
         netThread.setDaemon(true);
         netThread.start();
-        getLogger().log(Level.INFO, "已启动，连接 " + host + ":" + port);
+
+        if (c.getBoolean("console-log", true)) {
+            attachLogForwarder();          // 服务器控制台日志实时转发（可配置关掉）
+        }
+
+        if (frpEnabled) {
+            // 立即异步拉一次节点清单（不阻塞启动），之后每小时刷新一次
+            Bukkit.getScheduler().runTaskAsynchronously(this, this::refreshFrpNodes);
+            Bukkit.getScheduler().runTaskTimerAsynchronously(
+                    this, this::refreshFrpNodes, 20L * 60 * 60, 20L * 60 * 60);
+            beatThread = new Thread(this::runFrpHubLoop, "mc-agent-frp-beat");
+            beatThread.setDaemon(true);
+            beatThread.start();
+            getLogger().log(Level.INFO, "已启动，控制通道 " + host + ":" + port
+                    + "，FRP 心跳(UDP)走 " + frpNodesUrl + " 的节点清单");
+        } else if (beatPort > 0) {
+            beatThread = new Thread(this::runBeatLoop, "mc-agent-beat");
+            beatThread.setDaemon(true);
+            beatThread.start();
+            getLogger().log(Level.INFO, "已启动，控制通道 " + host + ":" + port
+                    + "，心跳专线(TCP) " + host + ":" + beatPort);
+        } else {
+            getLogger().log(Level.INFO, "已启动，连接 " + host + ":" + port + "（心跳与控制通道共用）");
+        }
     }
 
     @Override
@@ -108,6 +182,123 @@ public final class MCAgent extends JavaPlugin {
         if (netThread != null) {
             netThread.interrupt();
             netThread = null;
+        }
+        if (beatThread != null) {
+            beatThread.interrupt();
+            beatThread = null;
+        }
+        if (logThread != null) {
+            logThread.interrupt();
+            logThread = null;
+        }
+    }
+
+    // ================= 控制台日志：跟随服务器自己的 logs/latest.log =================
+    /**
+     * 为什么不挂 JUL Handler：这台 Paper 1.12.2 的日志实际走 log4j，
+     * 往根日志器上加 Handler 一条都收不到（实测）。改跟日志文件——
+     * 与日志框架无关，堆栈行、第三方插件的输出一视同仁。
+     */
+    private void attachLogForwarder() {
+        logThread = new Thread(this::runLogLoop, "mc-agent-log");
+        logThread.setDaemon(true);
+        logThread.start();
+    }
+
+    /** 单行过滤 + 入队。队列满即丢：宁可少几行日志，也不拖慢服务器。 */
+    private void enqueueLine(String raw) {
+        if (raw == null) {
+            return;
+        }
+        String line = raw.replace("\r", "").trim();
+        if (line.isEmpty() || line.contains("[mc-agent]")) {
+            return;                       // agent 自己的行不回传，免得自激
+        }
+        if (line.length() > LOG_LINE_MAX) {
+            line = line.substring(0, LOG_LINE_MAX) + "…";
+        }
+        logQueue.offer(line);
+    }
+
+    private void runLogLoop() {
+        long offset = -1;                 // -1：还没定位；首轮只取尾部预热
+        String carry = "";                // 上次读到的半行（字节被切断的情况）
+        while (running) {
+            try {
+                Path f = serverRoot().resolve("logs").resolve("latest.log");
+                if (!Files.exists(f)) {
+                    sleepQuietly(1000);
+                    continue;
+                }
+                long size = Files.size(f);
+                if (offset < 0) {
+                    offset = Math.max(0, size - 64 * 1024);   // 预热：最多回看 64KB
+                } else if (size < offset) {
+                    offset = 0;                   // 日志被轮转/清空
+                }
+                if (size > offset) {
+                    int want = (int) Math.min(size - offset, 256 * 1024);
+                    byte[] buf = new byte[want];
+                    try (RandomAccessFile raf = new RandomAccessFile(f.toFile(), "r")) {
+                        raf.seek(offset);
+                        raf.readFully(buf);
+                    }
+                    offset += buf.length;
+                    String chunk = carry + new String(buf, java.nio.charset.StandardCharsets.UTF_8);
+                    int cut = chunk.lastIndexOf('\n');
+                    if (cut < 0) {
+                        carry = chunk;            // 整块都没有换行：继续攒
+                    } else {
+                        carry = chunk.substring(cut + 1);
+                        String body = chunk.substring(0, cut);
+                        String[] lines = body.split("\n");
+                        int n = 0;
+                        for (String l : lines) {
+                            enqueueLine(l);
+                            if (++n >= LOG_BATCH * 5) {       // 单轮上限，防积压
+                                break;
+                            }
+                        }
+                    }
+                }
+                flushLogQueue();
+                sleepQuietly(500);
+            } catch (Throwable ignored) {
+                sleepQuietly(1000);           // 文件被占用/删掉的瞬时异常，下一轮再来
+            }
+        }
+    }
+
+    /** 攒到的一批日志合并成一条帧发出去（几十行只花一个帧头）。 */
+    private void flushLogQueue() {
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        String more;
+        while (n < LOG_BATCH && (more = logQueue.poll()) != null) {
+            if (n > 0) {
+                sb.append('\n');
+            }
+            sb.append(more);
+            n++;
+        }
+        if (n > 0) {
+            sendLog(sb.toString());
+        }
+    }
+
+    private void sendLog(String text) {
+        OutputStream out = netOut;
+        if (out == null) {
+            return;                       // 控制通道没连上，日志先不推
+        }
+        synchronized (writeLock) {
+            try {
+                out.write(codec.packLog((int) (System.currentTimeMillis() / 1000),
+                        logSeq.getAndIncrement(), currentTps, currentPlayers, text));
+                out.flush();
+            } catch (Exception ignored) {
+                // 这里不能 getLogger().log(...)：那会再进队列绕回来
+            }
         }
     }
 
@@ -150,6 +341,153 @@ public final class MCAgent extends JavaPlugin {
         }
     }
 
+    /** 心跳专线：一条只发 64B 心跳的连接，不收任何东西，也不参与控制通道的写锁。 */
+    private void runBeatLoop() {
+        while (running) {
+            try {
+                try (Socket socket = new Socket()) {
+                    socket.connect(new InetSocketAddress(host, beatPort), 5000);
+                    socket.setTcpNoDelay(true);
+                    OutputStream out = socket.getOutputStream();
+                    beatOut = out;
+                    beatDedicated = true;
+                    getLogger().log(Level.INFO, "心跳专线已连上 " + host + ":" + beatPort);
+
+                    while (running && !Thread.currentThread().isInterrupted()) {
+                        long now = System.currentTimeMillis();
+                        // 专线独占，无需加锁：这条连接上没有别的写者
+                        out.write(codec.packHeartbeat((int) (now / 1000), currentTps, currentPlayers));
+                        out.flush();
+                        sleepQuietly(intervalMs);
+                    }
+                }
+            } catch (Exception e) {
+                // 中断由循环条件的 running / isInterrupted 收口，这里只处理连接与 IO 异常
+                if (running) {
+                    getLogger().log(Level.WARNING, "心跳专线异常，本次心跳退回控制通道: " + e.getMessage());
+                }
+            } finally {
+                beatOut = null;
+                beatDedicated = false;     // 交还给控制线程，避免两边都不发心跳
+            }
+            sleepQuietly(reconnectMs);
+        }
+    }
+
+    // ================= FRP 心跳：UDP 发往 frp 公共节点 =================
+    /**
+     * FRP 心跳专线：把 64B 心跳以 UDP 发给 frp_nodes.json 里的节点（国内低延迟，轮询单节点）。
+     * 不走控制通道的 TCP，也不连控制器本身 —— 控制器在 82 的 25600 UDP 入口收到这些包。
+     * 节点清单由 refreshFrpNodes 每小时拉一次（frpNodes 为空时只空转，不报错）。
+     *
+     * 频率口径（很重要，否则自己把自己限掉）：控制器按「收到包的源 IP」每 60s 限 30 包。
+     * 82 实际看到的源 IP 取决于 139 怎么把 4094 转发到 82:25600 —— 若 139 用自身 socket
+     * 转发，所有包都算 139 一个 IP，多个服务器会共享这 30 包/分钟。因此这里【每个周期只发一个
+     * 节点、下一个周期轮到下一个】，总速率恒为 60000/frpBeatMs：默认 2500ms ⇒ 24 包/分钟，
+     * 无论 139 是否保留 frp 节点源 IP 都不会超 30。某节点挂了，下个周期自动换下一个，仍保活。
+     * （即使 UDP 被限，TCP 控制通道每 1s 也发心跳保活，服务器不会因此离线。）
+     */
+    private void runFrpHubLoop() {
+        while (running) {
+            try (DatagramSocket ds = new DatagramSocket()) {
+                ds.setSoTimeout(0);
+                while (running && !Thread.currentThread().isInterrupted()) {
+                    java.util.List<InetSocketAddress> nodes = frpNodes;
+                    long now = System.currentTimeMillis();
+                    byte[] beat = codec.packHeartbeat((int) (now / 1000), currentTps, currentPlayers);
+                    if (nodes != null && !nodes.isEmpty()) {
+                        int idx = frpRotate % nodes.size();      // 轮询：本周期只打一个节点
+                        frpRotate++;
+                        try {
+                            ds.send(new DatagramPacket(beat, beat.length, nodes.get(idx)));
+                            lastFrpHint = now;
+                        } catch (Exception ignored) {
+                            // 该节点解析/不可达：忽略，下个周期换下一个
+                        }
+                    }
+                    sleepQuietly(frpBeatMs);
+                }
+            } catch (Exception e) {
+                if (running) {
+                    getLogger().log(Level.WARNING, "FRP 心跳套接字异常，稍后重建: " + e.getMessage());
+                }
+            }
+            sleepQuietly(reconnectMs);
+        }
+    }
+
+    /** 拉取并解析 frp 节点清单；失败或为空则保留旧列表（不回退成空）。 */
+    private void refreshFrpNodes() {
+        try {
+            URL u = new URL(frpNodesUrl);
+            HttpURLConnection conn = (HttpURLConnection) u.openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setRequestProperty("User-Agent", "mc-agent/1.3.0");
+            conn.setRequestProperty("Accept", "application/json");
+            try (java.io.InputStream in = conn.getInputStream()) {
+                byte[] buf = new byte[65536];
+                int n, total = 0;
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                while ((n = in.read(buf)) > 0) {
+                    bos.write(buf, 0, n);
+                    total += n;
+                    if (total > 65536) break;       // 清单不可能这么大，防爆内存
+                }
+                java.util.List<InetSocketAddress> nodes = parseFrpNodes(
+                        new String(bos.toByteArray(), java.nio.charset.StandardCharsets.UTF_8));
+                if (!nodes.isEmpty()) {
+                    frpNodes = nodes;
+                    getLogger().log(Level.INFO, "已拉取 FRP 心跳节点 " + nodes.size() + " 个");
+                } else {
+                    getLogger().log(Level.WARNING, "frp_nodes.json 未解析出节点，沿用旧清单");
+                }
+            } finally {
+                conn.disconnect();
+            }
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING,
+                    "拉取 FRP 节点清单失败（沿用旧清单）: " + e.getMessage());
+        }
+    }
+
+    /** 手撸解析固定格式 {nodes:[{host,port}...]}，不依赖任何 JSON 库（Java8 无内置）。
+     *  只认 nodes 数组内的 host/port 配对，顺序对应即可。 */
+    private java.util.List<InetSocketAddress> parseFrpNodes(String json) {
+        java.util.List<InetSocketAddress> out = new java.util.ArrayList<InetSocketAddress>();
+        if (json == null) return out;
+        int i = json.indexOf("\"nodes\"");
+        if (i < 0) return out;
+        int arr = json.indexOf('[', i);
+        if (arr < 0) return out;
+        int depth = 0, end = -1;
+        for (int j = arr; j < json.length(); j++) {
+            char c = json.charAt(j);
+            if (c == '[') depth++;
+            else if (c == ']') { depth--; if (depth == 0) { end = j; break; } }
+        }
+        if (end < 0) return out;
+        String body = json.substring(arr + 1, end);
+        Pattern pHost = Pattern.compile("\"host\"\\s*:\\s*\"([^\"]+)\"");
+        Pattern pPort = Pattern.compile("\"port\"\\s*:\\s*(\\d+)");
+        Matcher mh = pHost.matcher(body);
+        while (mh.find()) {
+            String host = mh.group(1);
+            Matcher mp = pPort.matcher(body);
+            String port = null;
+            while (mp.find()) {
+                if (mp.start() > mh.start()) { port = mp.group(1); break; }
+            }
+            if (port != null) {
+                try {
+                    out.add(new InetSocketAddress(host, Integer.parseInt(port)));
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return out;
+    }
+
     private void connectAndServe() throws Exception {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), 5000);
@@ -161,16 +499,47 @@ public final class MCAgent extends JavaPlugin {
 
             ByteArrayOutputStream acc = new ByteArrayOutputStream();
             long lastBeat = 0;
+            long lastRead = System.currentTimeMillis();
+            // 收到过控制器的 ACK 才启用静默判死：老控制器不会回 ACK，这条通道本来就一直
+            // 静默，无门控地判死会让它每 CTRL_IDLE_MS 断一次、反复重连（比原问题更糟）。
+            boolean ackSeen = false;
+
+            // 连上就立刻发一帧（hello）。
+            // 为什么必须：控制器靠「第一帧里的 token」把这条链路认到某台服务器名下。
+            // 心跳走专线时这条通道平时一个字都不出，于是服务器明明连着（TCP 在、心跳也在），
+            // 控制器却不知道它是谁 —— 下发指令只会回「MC 离线」，点了没反应。
+            // 这一帧不为心跳，只为认领身份。
+            try {
+                synchronized (writeLock) {
+                    out.write(codec.packHeartbeat((int) (System.currentTimeMillis() / 1000),
+                            currentTps, currentPlayers));
+                    out.flush();
+                }
+                lastBeat = System.currentTimeMillis();
+            } catch (Exception ignored) {
+                // 发不出去就当没发生：下面主循环会在 1s 后按常规路径重试
+            }
 
             while (running && !Thread.currentThread().isInterrupted()) {
                 long now = System.currentTimeMillis();
-                // 心跳（与回执线程共用写锁）
-                if (now - lastBeat >= intervalMs) {
+                // 心跳：专线通着时由专线线程按 interval-ms 发，这里不参与（避免被大回执挤到
+                // 防重放窗口外）；专线断了/还没连上时退回本通道，老控制器和降级期都不会离线。
+                // 专线正常时控制通道也每 CTRL_PROBE_MS 补一拍 —— 只为探测链路活性（见下）。
+                long beatEvery = beatDedicated ? CTRL_PROBE_MS : intervalMs;
+                if (now - lastBeat >= beatEvery) {
                     synchronized (writeLock) {
                         out.write(codec.packHeartbeat((int) (now / 1000), currentTps, currentPlayers));
                         out.flush();
                     }
                     lastBeat = now;
+                }
+                // 链路静默判死：对端进程没了、本机却收不到 FIN（TCP 半开）时，read 只会一直
+                // 超时，本线程永远不知道要重连 —— 表现就是「卡片在线、心跳正常，点什么都超时」。
+                // 靠控制器对控制通道心跳回的 ACK 做判据：连续 CTRL_IDLE_MS 没读到任何字节就重连。
+                if (ackSeen && now - lastRead > CTRL_IDLE_MS) {
+                    getLogger().log(Level.WARNING, "控制通道静默 " + (CTRL_IDLE_MS / 1000)
+                            + "s 无任何回应，判定链路已断，重连");
+                    return;
                 }
                 socket.setSoTimeout((int) Math.min(intervalMs, 1000));
                 int n;
@@ -185,6 +554,8 @@ public final class MCAgent extends JavaPlugin {
                     return;
                 }
                 if (n == 0) continue;
+                lastRead = System.currentTimeMillis();
+                ackSeen = true;
                 acc.write(chunk, 0, n);
 
                 // 变长帧切分：先判 type，命令/回执再从帧头 plen 定总长
@@ -339,7 +710,7 @@ public final class MCAgent extends JavaPlugin {
     // ================= QUERY =================
     private String queryDispatch(String s) {
         String body = s.substring("QUERY|".length());
-        String[] t = body.split("\\|");
+        String[] t = body.split("\\|", -1);
         if (t.length == 0) return "QUERY 用法: QUERY|PLAYERLIST|PLAYER|OFFLINE|WORLDLIST|WORLD|BLOCK|NEAR";
         String sub = t[0].trim().toUpperCase(Locale.ROOT);
         switch (sub) {
@@ -464,9 +835,12 @@ public final class MCAgent extends JavaPlugin {
 
     private String fsDispatch(String s) {
         try {
-            String body = s.substring("FS|".length());
-            String[] t = body.split("\\|");
-            if (t.length < 1) return "FS 用法: FS|READ|LIST|EXISTS|WRITE|APPEND|REPLACE|SETLINE";
+        String body = s.substring("FS|".length());
+        // limit=-1：保留尾随空字段。用默认的 split，`FS|LIST|`（根目录）会被拆成
+        // 只有 ["LIST"]，参数个数判断直接失败——根目录永远列不出来。
+        String[] t = body.split("\\|", -1);
+            if (t.length < 1) return "FS 用法: FS|READ|LIST|EXISTS|STAT|WRITE|APPEND|REPLACE|SETLINE"
+                    + "|DELETE|MOVE|COPY|MKDIR|TOUCH|DOWNLOAD";
             String op = t[0].trim().toUpperCase(Locale.ROOT);
             switch (op) {
                 case "READ": {
@@ -539,17 +913,135 @@ public final class MCAgent extends JavaPlugin {
                     Files.write(f, lines, java.nio.charset.StandardCharsets.UTF_8);
                     return "SETLINE OK 第" + no + "行";
                 }
+                /* ---- 下面这组是「文件管理器要用到的其余动作」：删/移/拷/建/看大小/下载分块 ---- */
+                case "DELETE": {
+                    require(t, 2, "FS|DELETE|<pathB64>");
+                    if (fsReadOnly) return "FS 只读";
+                    Path f = resolve(t[1].trim());
+                    if (!Files.exists(f)) return "不存在: " + f;
+                    // 服根目录是整台服务器的家底，误删等于把服务器拆了，不给这条路
+                    if (f.equals(serverRoot())) return "拒绝删除服务器根目录";
+                    int n = deleteTree(f);
+                    return "DELETE OK: " + f.getFileName() + "（" + n + " 项）";
+                }
+                case "MOVE": case "RENAME": {
+                    require(t, 3, "FS|MOVE|<srcB64>|<dstB64>");
+                    if (fsReadOnly) return "FS 只读";
+                    Path src = resolve(t[1].trim());
+                    Path dst = resolve(t[2].trim());
+                    if (!Files.exists(src)) return "不存在: " + src;
+                    if (dst.startsWith(src)) return "不能移动到自身的子目录";
+                    if (dst.getParent() != null) Files.createDirectories(dst.getParent());
+                    Files.move(src, dst, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    return "MOVE OK: " + src.getFileName() + " → " + dst.getFileName();
+                }
+                case "COPY": {
+                    require(t, 3, "FS|COPY|<srcB64>|<dstB64>");
+                    if (fsReadOnly) return "FS 只读";
+                    Path src = resolve(t[1].trim());
+                    Path dst = resolve(t[2].trim());
+                    if (!Files.exists(src)) return "不存在: " + src;
+                    if (dst.startsWith(src)) return "不能复制到自身的子目录";
+                    if (dst.getParent() != null) Files.createDirectories(dst.getParent());
+                    int n = copyTree(src, dst);
+                    return "COPY OK: " + src.getFileName() + " → " + dst.getFileName() + "（" + n + " 项）";
+                }
+                case "MKDIR": {
+                    require(t, 2, "FS|MKDIR|<pathB64>");
+                    if (fsReadOnly) return "FS 只读";
+                    Path d = resolve(t[1].trim());
+                    Files.createDirectories(d);
+                    return "MKDIR OK: " + d.getFileName();
+                }
+                case "TOUCH": {
+                    require(t, 2, "FS|TOUCH|<pathB64>");
+                    if (fsReadOnly) return "FS 只读";
+                    Path f = resolve(t[1].trim());
+                    if (f.getParent() != null) Files.createDirectories(f.getParent());
+                    if (!Files.exists(f)) Files.createFile(f);
+                    return "TOUCH OK: " + f.getFileName();
+                }
+                case "STAT": {
+                    // 单文件/目录的元信息：网页端下载前先问一句「多大」，再决定分几块拉
+                    require(t, 2, "FS|STAT|<pathB64>");
+                    Path f = resolve(t[1].trim());
+                    if (!Files.exists(f)) return "不存在: " + f;
+                    boolean d = Files.isDirectory(f);
+                    long sz = d ? 0 : Files.size(f);
+                    String m = d ? "-" : new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                            .format(new Date(Files.getLastModifiedTime(f).toMillis()));
+                    return "STAT\t" + (d ? "D" : "F") + "\t" + sz + "\t" + m;
+                }
+                case "DOWNLOAD": {
+                    // 分块读，二进制安全：正文走 base64，前端逐块取回拼成原文件。
+                    // 不复用 READ 的原因：READ 按 UTF-8 解码，zip/jar/图片会直接读坏。
+                    require(t, 3, "FS|DOWNLOAD|<pathB64>|<offset>[|<len>]");
+                    Path f = resolve(t[1].trim());
+                    if (!Files.exists(f)) return "文件不存在: " + f;
+                    if (Files.isDirectory(f)) return "这是目录，不能下载";
+                    long total = Files.size(f);
+                    long off = Long.parseLong(t[2].trim());
+                    if (off < 0 || off > total) off = 0;
+                    long len = t.length >= 4 && !t[3].trim().isEmpty()
+                            ? Long.parseLong(t[3].trim()) : fsMaxReadBytes;
+                    len = Math.max(1, Math.min(len, fsMaxReadBytes));
+                    byte[] buf = new byte[(int) Math.min(len, total - off)];
+                    try (RandomAccessFile raf = new RandomAccessFile(f.toFile(), "r")) {
+                        raf.seek(off);
+                        raf.readFully(buf);
+                    }
+                    return "----- " + f + " -----\nsize=" + total + " offset=" + off
+                            + " len=" + buf.length + "\n"
+                            + Base64.getEncoder().encodeToString(buf);
+                }
                 default: return "未知 FS 操作: " + op;
             }
         } catch (IllegalArgumentException e) {
-            return "FS 参数错误: " + e.getMessage();
+            // e.getMessage() 是内部用法串（FS|LIST|<pathB64> 之类），不适合直接给用户看
+            return "文件操作参数不完整";
         } catch (Exception e) {
-            return "FS 失败: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+            return "文件操作失败：" + e.getMessage();
         }
     }
 
     private static void require(String[] t, int n, String usage) {
         if (t.length < n) throw new IllegalArgumentException(usage);
+    }
+
+    /** 递归删除，返回动过的条目数（目录本身算一项）。先收子项再收自己，深度不限。 */
+    private int deleteTree(Path p) throws Exception {
+        if (!Files.isDirectory(p)) {
+            Files.deleteIfExists(p);
+            return 1;
+        }
+        int n = 1;
+        java.util.List<Path> kids = new ArrayList<>();
+        try (java.util.stream.Stream<Path> st = Files.list(p)) {
+            st.forEach(kids::add);
+        }
+        for (Path kid : kids) {
+            n += deleteTree(kid);
+        }
+        Files.deleteIfExists(p);
+        return n;
+    }
+
+    /** 递归复制，返回复制条目数。目标是文件时按覆盖算，免得「复制过去发现没生效」。 */
+    private int copyTree(Path src, Path dst) throws Exception {
+        if (!Files.isDirectory(src)) {
+            Files.copy(src, dst, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            return 1;
+        }
+        Files.createDirectories(dst);
+        int n = 1;
+        java.util.List<Path> kids = new ArrayList<>();
+        try (java.util.stream.Stream<Path> st = Files.list(src)) {
+            st.forEach(kids::add);
+        }
+        for (Path kid : kids) {
+            n += copyTree(kid, dst.resolve(kid.getFileName().toString()));
+        }
+        return n;
     }
 
     // ================= 回执：立即新线程发送（变长，无长度限制） =================
