@@ -29,19 +29,20 @@ from framework.messaging.protocol import ProtocolAdapter
 logger = logging.getLogger("zcbot")
 
 
-def _load_frames():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "protocol.py")
-    spec = importlib.util.spec_from_file_location("mc_link_protocol", path)
+def _load_module(filename, modname):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    spec = importlib.util.spec_from_file_location(modname, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-P = _load_frames()
+P = _load_module("protocol.py", "mc_link_protocol")
+R = _load_module("rpc.py", "mc_link_rpc")
 
 __plugin_meta__ = {
     "name": "mc_link",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "ZGRIC",
     "desc": "MC agent 私有 TCP 帧协议独立适配器（非 HTTP，走 frp tcp 隧道）",
     "priority": 10,
@@ -60,7 +61,9 @@ class McLinkAdapter(ProtocolAdapter):
         self.framework = framework
         self.bot_name = str(cfg.get("bot_name") or "mc_link")
         self.host = str(cfg.get("host") or "0.0.0.0")
-        self.port = int(cfg.get("port") or P.DEFAULT_TCP_PORT)
+        # 0 是「让内核随机分配端口」的合法值，不能用 `or` 兜底成默认端口
+        _port = cfg.get("port")
+        self.port = P.DEFAULT_TCP_PORT if _port is None else int(_port)
         self.secret = str(cfg.get("secret") or os.environ.get("MC_SECRET")
                           or "zcboot-mc-please-change-me").encode("utf-8")
 
@@ -71,6 +74,15 @@ class McLinkAdapter(ProtocolAdapter):
         self._server = None
         self._watchdog = None
         self._started = False
+
+        # v1 对账状态：epoch 单调，变更日志只保留有限窗口（对齐 Kubernetes
+        # watch 的历史窗口 / 410 Gone 语义），窗口不足时要求对端全量重拉。
+        self._epoch = 0
+        self._changes = deque(maxlen=1024)
+        self._rpc = R.RpcHub("server", self._send_rpc_frame, on_event=self._rpc_event)
+        self._rpc.register_method("zcore.sync", self._rpc_sync)
+        # pass 闸门默认 fail-closed：业务插件（zcore whitelist）注册后覆盖
+        self._rpc.register_method("zcore.pass.query", self._rpc_pass_pending)
 
     # ---------------------------------------------------------------- 契约
     def get_connection_info(self) -> dict:
@@ -100,6 +112,12 @@ class McLinkAdapter(ProtocolAdapter):
             return await self.send_command(params.get("command", ""))
         if action == "status":
             return self.status()
+        if action == "call_rpc":
+            return await self.call_rpc(params.get("method", ""),
+                                       params.get("params"),
+                                       float(params.get("timeout", 5.0)))
+        if action == "bump_epoch":
+            return {"ok": True, "epoch": await self.bump_epoch(params.get("item") or {})}
         return {"ok": False, "error": "unsupported-action"}
 
     def start(self):
@@ -162,7 +180,7 @@ class McLinkAdapter(ProtocolAdapter):
                     ftype = buf[0]
                     if ftype == P.HEARTBEAT_TYPE:
                         total = P.HEADER_LEN
-                    elif ftype in (P.COMMAND_TYPE, P.OUTPUT_TYPE):
+                    elif ftype in P.VARIABLE_TYPES:
                         if len(buf) < P.HEADER_LEN:
                             break
                         plen = int.from_bytes(buf[P.PLEN_OFF:P.PLEN_OFF + 4], "big")
@@ -172,7 +190,19 @@ class McLinkAdapter(ProtocolAdapter):
                             continue
                         total = P.HEADER_LEN + plen
                     else:
-                        del buf[0]
+                        # RFC 9113 §4.1：未知帧类型 MUST 忽略并丢弃。
+                        # 帧头足够时按 plen 整帧跳过，避免逐字节重同步把正文误判为帧头。
+                        if len(buf) < P.HEADER_LEN:
+                            break
+                        plen = int.from_bytes(buf[P.PLEN_OFF:P.PLEN_OFF + 4], "big")
+                        if plen > P.MAX_PAYLOAD:
+                            del buf[0]
+                            continue
+                        total = P.HEADER_LEN + plen
+                        if len(buf) < total:
+                            break
+                        self._log(f"[drop] 未知帧类型 0x{ftype:02x} 已整帧忽略")
+                        del buf[:total]
                         continue
                     if len(buf) < total:
                         break
@@ -181,6 +211,8 @@ class McLinkAdapter(ProtocolAdapter):
                     await self._dispatch(peer, frame)
         finally:
             self._peers.pop(peer.addr, None)
+            # 未决调用交给 call() 的超时/finally 回收；多 agent 共享 hub，
+            # 不在此清空其它连接仍在等待的 Future。
             try:
                 writer.close()
             except Exception:
@@ -189,6 +221,16 @@ class McLinkAdapter(ProtocolAdapter):
 
     async def _dispatch(self, peer, frame: bytes):
         ftype, ts, tok, tps, players, plen, seq, text = P.FrameCodec.parse(frame)
+
+        # v1 保留区签名：v0（全 0）放行，v1 验不过直接丢
+        if not P.FrameCodec.verify_ext(self.secret, frame):
+            self._log(f"[drop] {peer.addr} bad-ext-sig")
+            return
+
+        # RPC 帧走独立的 seq 单调空间：同秒多帧不能被 ts 单调判重误杀
+        if ftype in (P.REQ_TYPE, P.RESP_TYPE):
+            await self._dispatch_rpc(peer, frame, ftype, ts, tok, seq)
+            return
 
         if ftype == P.OUTPUT_TYPE:
             if abs(time.time() - ts) > P.REPLAY_WINDOW:
@@ -213,9 +255,33 @@ class McLinkAdapter(ProtocolAdapter):
         peer.tps, peer.players = tps, players
         self._status.update({"online": True, "tps": round(tps, 2), "players": players,
                              "last_beat": int(peer.last_beat)})
+
+        # 能力协商：magic 出现的首帧即声明对端支持 v1（RSocket SETUP / WAMP HELLO 语义）
+        is_v1, ver, flags, cap, epoch, _ext = P.parse_ext(frame)
+        if is_v1:
+            peer.ver, peer.cap = ver, cap
+            if flags & P.FLAG_EPOCH:
+                peer.known_epoch = epoch
+            self._status["peer_ver"] = ver
+            self._status["peer_cap"] = cap
+
         if ftype == P.HEARTBEAT_TYPE:
             await self._emit_notice("mc_heartbeat", addr=str(peer.addr),
-                                    tps=tps, players=players)
+                                    tps=tps, players=players, epoch=self._epoch,
+                                    peer_epoch=peer.known_epoch, cap=peer.cap)
+            # BOOKMARK / ACK：心跳是 agent→控制器单向，控制器必须回一帧才能把
+            # 权威 epoch 送回去。只带版本号，不带业务数据（RSocket KEEPALIVE
+            # 的 Last Received Position / Kubernetes BOOKMARK 语义）。
+            # 仅对声明了 v1 能力的对端回帧，老 agent 收到 v0 心跳时行为完全不变。
+            if is_v1 and (cap & P.CAP_RPC):
+                try:
+                    bookmark = P.FrameCodec.pack_heartbeat(
+                        self.secret, int(time.time()), tps, players,
+                        cap=P.CAP_ALL, epoch=self._epoch)
+                    peer.writer.write(bookmark)
+                    await peer.writer.drain()
+                except Exception as e:
+                    self._log(f"[bookmark] 回送失败: {e}")
         elif ftype == P.COMMAND_TYPE and text:
             cok, creason = P.FrameCodec.verify_output(self.secret, ts, tok, seq, peer.cmd_seq)
             if not cok:
@@ -223,6 +289,93 @@ class McLinkAdapter(ProtocolAdapter):
                 return
             peer.cmd_seq = seq
             await self._emit_notice("mc_command", addr=str(peer.addr), text=text, seq=seq)
+        elif ftype == P.LOG_TYPE and text:
+            await self._emit_notice("mc_log", addr=str(peer.addr), text=text, seq=seq)
+
+    # ---------------------------------------------------------------- v1 RPC
+    async def _dispatch_rpc(self, peer, frame, ftype, ts, tok, seq):
+        if abs(time.time() - ts) > P.REPLAY_WINDOW:
+            self._log(f"[drop] {peer.addr} rpc:stale-timestamp")
+            return
+        if not P.FrameCodec.verify_rpc(self.secret, frame):
+            self._log(f"[drop] {peer.addr} rpc:bad-signature")
+            return
+        if seq <= peer.rpc_rx_seq:
+            self._log(f"[drop] {peer.addr} rpc:replay-seq")
+            return
+        peer.rpc_rx_seq = seq
+        peer.last_beat = time.time()
+        peer.offline = False
+        _sig, body = P.FrameCodec.rpc_payload(frame)
+        env, err = R.decode(body)
+        if env is None:
+            msg = "Parse error" if err == R.PARSE_ERROR else "Invalid Request"
+            await self._send_rpc_frame(peer, P.RESP_TYPE, R.make_error(None, err, msg))
+            return
+        is_v1, ver, _flags, cap, _epoch, _ext = P.parse_ext(frame)
+        if is_v1:
+            peer.ver, peer.cap = ver, cap
+        await self._rpc.on_envelope(peer, env)
+
+    async def _send_rpc_frame(self, peer, ftype: int, env: dict):
+        if not (peer.cap & P.CAP_RPC):
+            raise RuntimeError("peer has no rpc capability (v0 or cap=0)")
+        body = R.encode(env)
+        peer.rpc_tx_seq += 1
+        frame = P.FrameCodec.pack_rpc(
+            self.secret, int(time.time()), peer.rpc_tx_seq,
+            peer.tps, peer.players, ftype, body,
+            cap=P.CAP_ALL, epoch=self._epoch)
+        peer.writer.write(frame)
+        await peer.writer.drain()
+
+    def _rpc_event(self, name, env):
+        self._log(f"[rpc] {name} {env.get('method') or env.get('id')}")
+
+    def _rpc_sync(self, params, peer=None):
+        """增量对账：since 之后的所有变更；窗口不足时要求对端全量重拉。"""
+        since = 0
+        if isinstance(params, dict):
+            try:
+                since = int(params.get("since", 0))
+            except (TypeError, ValueError):
+                raise R.RpcFailure(R.INVALID_PARAMS, "since must be an integer")
+        if since < 0 or since > self._epoch:
+            raise R.RpcFailure(R.INVALID_PARAMS, "since out of range")
+        if since > 0 and self._changes and since < self._changes[0][0] - 1:
+            # 等价 Kubernetes 410 Gone：历史窗口已被裁剪，必须清空本地重新全量 list
+            raise R.RpcFailure(R.EPOCH_TOO_OLD,
+                               "epoch too old; clear local state and resync from 0")
+        items = [item for ep, item in self._changes if ep > since]
+        return {"epoch": self._epoch, "since": since, "full": since == 0,
+                "items": items}
+
+    def _rpc_pass_pending(self, params, peer=None):
+        """默认闸门：未接入 whitelist 业务插件时一律 pending，绝不默认放行。"""
+        return dict(R.PASS_PENDING)
+
+    async def bump_epoch(self, item):
+        """业务插件签发 pass 后调用：推进 epoch、记变更、推 Notification。"""
+        self._epoch += 1
+        self._changes.append((self._epoch, item))
+        self._status["epoch"] = self._epoch
+        for peer in list(self._peers.values()):
+            if peer.cap & P.CAP_PUSH:
+                await self._rpc.notify(peer, "zcore.pass.changed",
+                                       {"epoch": self._epoch, "item": item})
+        return self._epoch
+
+    def register_method(self, name, handler):
+        """供 zcore whitelist 等业务插件注入方法（如 zcore.pass.query）。"""
+        self._rpc.register_method(name, handler)
+
+    async def call_rpc(self, method, params=None, timeout=5.0):
+        """Python 侧主动发起 REQ（偶数 id）。"""
+        peer = next((p for p in self._peers.values() if not p.offline), None)
+        if peer is None:
+            return {"ok": False, "error": {"code": R.PASS_UNAVAILABLE,
+                                           "message": "mc-offline"}}
+        return await self._rpc.call(peer, method, params, timeout)
 
     async def _emit_notice(self, kind: str, **fields):
         """转成框架 notice 事件；bot_name=mc_link 让插件按来源单独订阅。"""
@@ -287,7 +440,9 @@ class McLinkAdapter(ProtocolAdapter):
             self._pending.pop(seq, None)
 
     def status(self) -> dict:
-        return dict(self._status, peers=len(self._peers), adapter=self.adapter_id)
+        return dict(self._status, peers=len(self._peers), adapter=self.adapter_id,
+                    epoch=self._epoch, rpc_methods=sorted(
+                        k for k in self._rpc.methods if not k.startswith("rpc.")))
 
     async def _watchdog_loop(self):
         while True:

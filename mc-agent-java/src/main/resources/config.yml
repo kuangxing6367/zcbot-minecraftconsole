@@ -8,6 +8,13 @@ secret: "zcboot-mc-please-change-me"
 interval-ms: 1000      # 心跳周期（毫秒）
 reconnect-ms: 3000     # 断线重连间隔（毫秒）
 
+# ── v1 RPC / 跳包机制（默认关闭）──
+# 开启后：控制通道心跳声明能力，控制器回一帧只带 epoch 的 BOOKMARK，
+# 发现版本落后才发 zcore.sync 增量拉取；业务走 REQ/RESP 帧，全程复用
+# 同一条已存在的 TCP 连接，不需要新开任何端口，也不走 HTTP。
+# 关闭时所有帧字节与 v1.3.0 完全一致，可与旧控制器混用。
+rpc-enabled: false
+
 # ── FRP 心跳（专用 UDP，国内低延迟）──
 # 心跳不再走 TCP 专线，而是把 64B 心跳以 UDP 发给下面 URL 返回的节点清单（每节点 host:port）。
 # 路径：agent → frp 公共 UDP 入口 → 139:4094 → 82:25600 控制器 UDP 入口。

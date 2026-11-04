@@ -1,6 +1,6 @@
 # mc-agent 服务器侧插件
 name: mc-agent
-version: 1.3.0
+version: 1.4.0
 main: com.zgric.mcagent.MCAgent
 api-version: 1.12
 author: ZGRIC

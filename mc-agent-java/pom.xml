@@ -6,7 +6,7 @@
 
     <groupId>com.zgric</groupId>
     <artifactId>mc-agent</artifactId>
-    <version>1.3.0</version>
+    <version>1.4.0</version>
     <packaging>jar</packaging>
     <name>mc-agent</name>
     <description>minecraftconsole 服务器侧 agent：FRP 穿透 + 心跳上报 + 命令执行</description>

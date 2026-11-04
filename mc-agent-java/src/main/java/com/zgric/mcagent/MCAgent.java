@@ -56,6 +56,8 @@ import java.util.logging.Level;
 public final class MCAgent extends JavaPlugin {
 
     private FrameCodec codec;
+    private RpcHub rpc;                  // v1 双向 RPC / 跳包状态机（零 Bukkit 依赖）
+    private boolean rpcEnabled = false;
     private volatile boolean running = false;
     private Thread netThread;
     private Thread beatThread;
@@ -142,6 +144,17 @@ public final class MCAgent extends JavaPlugin {
         fsMaxReadBytes = c.getLong("fs.max-read-bytes", 256 * 1024);
 
         codec = new FrameCodec(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        rpcEnabled = c.getBoolean("rpc-enabled", false);
+        rpc = new RpcHub(codec, new RpcHub.Sender() {
+            @Override public void send(byte[] frame) throws Exception {
+                OutputStream target = netOut;
+                if (target == null) throw new IllegalStateException("control channel not connected");
+                synchronized (writeLock) {
+                    target.write(frame);
+                    target.flush();
+                }
+            }
+        }, rpcEnabled);
 
         Bukkit.getScheduler().runTaskTimer(this, this::onTick, 0L, 1L);
         Bukkit.getScheduler().runTaskTimer(this, this::refreshHeartbeatData, 20L, 20L);
@@ -179,6 +192,7 @@ public final class MCAgent extends JavaPlugin {
     @Override
     public void onDisable() {
         running = false;
+        if (rpc != null) rpc.shutdown();
         if (netThread != null) {
             netThread.interrupt();
             netThread = null;
@@ -488,6 +502,16 @@ public final class MCAgent extends JavaPlugin {
         return out;
     }
 
+    /** 控制通道心跳。v1 开启时带能力位图 + 本地水位；关闭时字节与旧版逐字节一致。
+     *  UDP 心跳专线不使用本方法 —— 那条链路保持 v0，避免影响既有上报与限速。 */
+    private byte[] heartbeatFrame(int ts) {
+        if (!rpcEnabled) {
+            return codec.packHeartbeat(ts, currentTps, currentPlayers);
+        }
+        return codec.packHeartbeatV1(ts, currentTps, currentPlayers,
+                FrameCodec.CAP_ALL, rpc == null ? 0 : rpc.getKnownEpoch());
+    }
+
     private void connectAndServe() throws Exception {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), 5000);
@@ -511,8 +535,7 @@ public final class MCAgent extends JavaPlugin {
             // 这一帧不为心跳，只为认领身份。
             try {
                 synchronized (writeLock) {
-                    out.write(codec.packHeartbeat((int) (System.currentTimeMillis() / 1000),
-                            currentTps, currentPlayers));
+                    out.write(heartbeatFrame((int) (System.currentTimeMillis() / 1000)));
                     out.flush();
                 }
                 lastBeat = System.currentTimeMillis();
@@ -528,7 +551,7 @@ public final class MCAgent extends JavaPlugin {
                 long beatEvery = beatDedicated ? CTRL_PROBE_MS : intervalMs;
                 if (now - lastBeat >= beatEvery) {
                     synchronized (writeLock) {
-                        out.write(codec.packHeartbeat((int) (now / 1000), currentTps, currentPlayers));
+                        out.write(heartbeatFrame((int) (now / 1000)));
                         out.flush();
                     }
                     lastBeat = now;
@@ -569,7 +592,8 @@ public final class MCAgent extends JavaPlugin {
                     int total;
                     if (ft == FrameCodec.HEARTBEAT_TYPE) {
                         total = FrameCodec.HEADER_LEN;
-                    } else if (ft == FrameCodec.COMMAND_TYPE || ft == FrameCodec.OUTPUT_TYPE) {
+                    } else {
+                        boolean known = FrameCodec.isVariableType(ft);
                         if (data.length - pos < FrameCodec.HEADER_LEN) { residue = true; break; }
                         int plen = ((data[pos + FrameCodec.PLEN_OFF] & 0xFF) << 24)
                                 | ((data[pos + FrameCodec.PLEN_OFF + 1] & 0xFF) << 16)
@@ -577,8 +601,13 @@ public final class MCAgent extends JavaPlugin {
                                 | (data[pos + FrameCodec.PLEN_OFF + 3] & 0xFF);
                         if (plen < 0 || plen > FrameCodec.MAX_PAYLOAD) { pos++; continue; } // 流失步
                         total = FrameCodec.HEADER_LEN + plen;
-                    } else {
-                        pos++; continue; // 重新同步
+                        if (!known) {
+                            // RFC 9113 §4.1：未知帧类型 MUST 忽略并丢弃。
+                            // 按 plen 整帧跳过，避免逐字节重同步把正文误判为帧头。
+                            if (data.length - pos < total) { residue = true; break; }
+                            pos += total;
+                            continue;
+                        }
                     }
                     if (data.length - pos < total) { residue = true; break; }
                     byte[] frame = Arrays.copyOfRange(data, pos, pos + total);
@@ -591,6 +620,7 @@ public final class MCAgent extends JavaPlugin {
             }
         } finally {
             netOut = null;
+            if (rpc != null) rpc.onDisconnected();
         }
     }
 
@@ -599,6 +629,23 @@ public final class MCAgent extends JavaPlugin {
 
     private void handleFrame(byte[] frame) {
         FrameCodec.Parsed p = FrameCodec.parse(frame);
+        if (!codec.verifyExtSig(frame)) {
+            getLogger().log(Level.WARNING, "丢弃帧(bad-ext-sig)");
+            return;
+        }
+        if (p.type == FrameCodec.HEARTBEAT_TYPE) {
+            // 控制器回的 BOOKMARK / ACK：只带权威 epoch，不带业务数据。
+            FrameCodec.Ext ext = FrameCodec.parseExt(frame);
+            if (ext.v1 && rpc != null) {
+                rpc.setPeerState(p.tps, p.players);
+                rpc.onHello(ext);
+            }
+            return;
+        }
+        if ((p.type == FrameCodec.REQ_TYPE || p.type == FrameCodec.RESP_TYPE) && rpc != null) {
+            rpc.onFrame(frame);
+            return;
+        }
         if (p.type != FrameCodec.COMMAND_TYPE || p.text.isEmpty()) return;
         String reason = verifyCmd(p.ts, p.token, p.seq);
         if (reason != null) {
