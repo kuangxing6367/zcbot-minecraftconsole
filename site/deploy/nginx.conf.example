@@ -1,0 +1,24 @@
+# MinecraftConsole 文档站 —— 静态站点示例配置
+# 目标域名：mc.zgric.top
+# 站点是纯静态文件，不含后端，不要在这里反代控制台端口。
+
+server {
+    listen 80;
+    server_name mc.zgric.top;
+    root /path/to/minecraftconsole/site/dist;
+    index index.html;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location ~* \.(js|css|svg|woff2|ico)$ {
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # HTTPS 证书由宝塔 / 面板侧签发并配置，仓库内不保存任何凭据。
+}
