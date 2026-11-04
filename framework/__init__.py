@@ -1,1 +1,1 @@
-# ZCBOT OneBot QQ机器人框架
+# ZCBOT 事件驱动 IM 平台

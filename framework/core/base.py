@@ -1,0 +1,787 @@
+"""
+框架核心引擎
+组装所有模块，启动生命周期（异步模型）
+
+插件化架构：
+- 核心壳：插件加载器 + 事件总线 + 消息路由 + ctx + 数据库
+- 官方插件：OneBot适配、WebUI、会话管理、定时调度（config 开关控制）
+- 用户插件：业务逻辑
+"""
+import asyncio
+import logging
+import logging.handlers
+import os
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+from framework.config import load_config
+from framework.database.db import init_db
+from framework.loader import PluginLoader
+from framework.messaging.router import MessageRouter
+from framework.messaging.event_bus import EventBus
+from framework.log_broker import log_broker, FrameworkLogHandler
+from framework.messaging.protocol import ServiceRegistry
+from framework.terminal import TerminalInput, terminal_commands, register_builtins
+from framework.hooks import HookRegistry, HookPoints
+from framework import i18n
+from framework.blackbox import blackbox as _global_blackbox
+
+logger = logging.getLogger('zcbot')
+
+
+from framework.core.stats_writer import AsyncStatsWriter  # noqa: F401  向后兼容 re-export
+
+
+from framework.core.dispatch import FrameworkDispatchMixin
+from framework.core.event_buffer import EventBuffer
+from framework.core.runtime import FrameworkRuntimeMixin
+
+class Framework(FrameworkDispatchMixin, FrameworkRuntimeMixin):
+    """框架核心引擎"""
+
+    def __init__(self, config_path: str = None, role: str = 'standard', ipc_client=None):
+        # 运行角色：standard=单进程（默认）/ core=双进程核心 / host=双进程宿主
+        # ipc_client：宿主模式下注入的 IPC 客户端（供 RemoteDatabase 使用）
+        self._role = role
+        self._ipc_client = ipc_client
+        # 记录实际使用的配置文件路径（供 Web API 读写 config.yaml 使用）
+        if config_path is None:
+            from framework.config import get_home
+            config_path = os.path.join(get_home(), 'config.yaml')
+        self.config_path = os.path.abspath(config_path)
+        self.config = load_config(config_path)
+        # 语言必须在 __init__ 早期就定下来：framework.initializing / init_done 两条日志
+        # 早于 start()，放到 start() 里设置会让这两条退回默认中文
+        i18n.set_language(os.environ.get('ZCBOT_LANG')
+                          or self.config.get('language')
+                          or i18n.DEFAULT_LANG)
+        # 内存黑匣子：按 framework.blackbox 配置初始化（默认开，100KB 上限）
+        _fw_cfg = self.config.get('framework', {}) or {}
+        _bb_cfg = _fw_cfg.get('blackbox', {}) or {}
+        _global_blackbox.configure(
+            enabled=_bb_cfg.get('enabled', True),
+            max_bytes=_bb_cfg.get('max_bytes', 102400),
+        )
+        # 出站闸门（发送节流 + 失败重试）：配置在此生效，之后可用 PUT /api/config/yaml/outbound 热改
+        from framework.messaging.outbound_guard import gate as _out_gate
+        _out_gate.configure(self.config.get('outbound'))
+        # 数据目录统一迁移（logs / plugins_dat → data/ 下），必须在日志与插件加载前执行
+        self._migrate_legacy_data_dirs()
+        # 日志合并器实例集（stop() 时统一停掉后台 flush 线程）
+        self._log_coalescers = []
+        self._setup_logging()
+
+        # 初始化各个模块
+        logger.info(i18n.t('framework.initializing'))
+
+        # 服务注册表（官方插件注册自身为核心能力）
+        self.services = ServiceRegistry()
+        # 多平台接入：每注册一个协议适配器即登记进 drive 表（自动分配稳定 uuid）
+        self.services.on_adapter_registered = self._on_adapter_registered
+
+        # 扩展点注册表（内核契约：插件可挂载到几乎每个运行环节）
+        self.hooks = HookRegistry(self)
+
+# 数据库：宿主模式下用 RemoteDatabase（经 IPC RPC 到核心进程执行）；否则真实数据库
+        if role == 'host' and ipc_client is not None:
+            from framework.ipc.remote_db import RemoteDatabase
+            self.db = RemoteDatabase(ipc_client)
+            logger.info("数据库已切换为 RemoteDatabase（双进程宿主模式，RPC 到核心）")
+        else:
+            self.db = init_db(self.config['database'])
+
+        # 降级标志：数据库不可用时，框架以 data/db 文件存储（JSON/YAML）运行
+        self.db_degraded = bool(getattr(self.db, 'degraded', False))
+        if self.db_degraded:
+            logger.warning(
+                "框架处于数据库降级模式：持久化能力受限，使用 data/db 下 JSON/YAML 文件存储"
+            )
+
+        # 存储抽象层接入点：当前后端（sqlite/mysql/debug）与调试模式标志。
+        # debug = 调试模式（低性能模式）：config 显式配置 database.type: debug，
+        # 在本机以 JSON 行集本地模拟 SQL（查询有语义），见 framework/database/storage.py。
+        self.storage_mode = getattr(self.db, 'db_type', 'unknown')
+        self.db_debug_mode = bool(getattr(self.db, 'debug_mode', False))
+        if self.db_debug_mode:
+            logger.warning(
+                "框架处于调试模式（低性能本地 SQL 模拟，database.type=debug）："
+                "SQL 语义可用但性能低、无真实事务，仅限开发调试，生产请用 sqlite/mysql"
+            )
+
+        # 多平台接入：适配器注册表（drive 表 ↔ 稳定 uuid 映射）。
+        # 必须在 services.on_adapter_registered 回调设置前建立，回调触发时会用到。
+        from framework.messaging.adapter_registry import AdapterRegistry
+        self.adapter_registry = AdapterRegistry(self.db, self)
+
+        # 数据库专用线程池
+        self._db_executor = ThreadPoolExecutor(
+            max_workers=max(8, min(32, (os.cpu_count() or 4) * 2)),
+            thread_name_prefix='zcdb',
+        )
+
+        # 事件总线
+        self.event_bus = EventBus()
+
+        # 消息路由器
+        self.router = MessageRouter(self)
+
+        # 插件加载器（支持 core_plugins/ + plugins/）
+        self.plugin_loader = PluginLoader(
+            self._get_plugins_dir(),
+            self,
+            self._get_plugins_dat_dir()
+        )
+
+        # 终端交互
+        self.terminal = TerminalInput(self)
+
+        # 本地调试控制台（无 TTY 也能接进运行中的框架；见 framework/console_server.py）
+        self.console_server = None
+
+        # 统计批量写库器
+        self.stats_writer = AsyncStatsWriter(self)
+
+        # 原始消息处理器注册表
+        self._raw_message_handlers = []
+        # 后台事件任务引用集
+        self._pending_tasks = set()
+
+        # 事件分层缓冲（生产者-消费者：适配器入队即返，后台 worker 异步处理）
+        # 配置节 event_queue: maxsize / workers / drain_timeout / buffer
+        #  buffer: L1 512KB 内存主缓冲 → sqlite 持久化溢出 → L3 4MB 内存兜底 → 全满告警丢弃
+        eq_cfg = self.config.get('event_queue', {}) or {}
+        self._event_queue_maxsize = int(eq_cfg.get('maxsize', 2000))
+        # 事件并行 worker 数：framework.conventions.event_workers 优先（0=自动=CPU×2），
+        # 否则沿用 event_queue.workers（默认 1）。
+        _conv = (self.config.get('framework', {}) or {}).get('conventions', {}) or {}
+        _fw_workers = int(_conv.get('event_workers', 0) or 0)
+        if _fw_workers > 0:
+            self._event_workers_count = max(1, _fw_workers)
+        else:
+            self._event_workers_count = max(1, int(eq_cfg.get('workers', 1)))
+        self._event_drain_timeout = float(eq_cfg.get('drain_timeout', 5))
+        from framework.config import get_home
+        self._event_buffer = EventBuffer(eq_cfg, os.path.join(get_home(), 'data'))
+        self._event_workers = []   # worker task 引用集（start() 填充）
+        # 会话分片并行（event_queue.workers > 1 时启用）：单一分发器从缓冲取事件、
+        # 盖内部唯一代号 _seq（0~9_999_999 轮转）后按会话键投入对应 worker 队列；
+        # 同群/同用户事件保序，跨会话并行。workers=1 时为 None，worker 直连缓冲。
+        self._shard_queues = None
+        self._event_distributor_task = None
+        self._event_seq = 0
+
+        # 群成员同步批量写库队列（notice 高频时合并落库，避免每条 to_thread + 单条 SQL）
+        self._member_sync_queue = asyncio.Queue(maxsize=20000)
+        self._member_sync_dropped = 0
+        self._member_sync_task = None
+        self._member_sync_interval = float(
+            (self.config.get('event_queue', {}) or {}).get('member_sync_interval', 2))
+
+        # 心跳参数
+        self._heartbeat_interval = self.config.get('plugin', {}).get('heartbeat_interval', 60)
+        self._heartbeat_task = None
+        self._running = False
+        self.loop = None
+        # 双进程核心进程注入的 IPC 服务端（供终端把宿主侧命令转发过去）
+        self.ipc_server = None
+
+        # 内存看门狗参数
+        mem_cfg = self.config.get('memory', {})
+        self._memory_limit_mb = mem_cfg.get('limit_mb', 120)
+        self._memory_check_interval = mem_cfg.get('check_interval', 30)
+        self._memory_watchdog_task = None
+
+        # 启动时间
+        import time
+        self._start_time = time.time()
+
+        # 启动就绪标记（start(wait_ready=False) 异步加载插件时，可 await wait_ready 等待就绪）
+        self._ready = False
+        self._ready_event = asyncio.Event()
+        self._startup_load_task = None
+
+        logger.info(i18n.t('framework.init_done'))
+
+    # ── 多平台接入：适配器自动登记 + 插件↔适配器绑定 ──
+
+    def _on_adapter_registered(self, adapter):
+        """ServiceRegistry 回调：把刚注册的协议适配器登记进 drive 表。"""
+        try:
+            key = adapter._connection_id()
+            kind = type(adapter).__name__
+            self_id = getattr(adapter, '_self_id', None) or getattr(adapter, 'app_id', None)
+            uuid_val = self.adapter_registry.ensure(key, kind=kind, self_id=self_id)
+            if uuid_val:
+                # 把 uuid 挂到适配器实例上，供调试/路由快速取用
+                try:
+                    adapter._drive_uuid = uuid_val
+                except Exception:
+                    pass
+                logger.info(
+                    f"多平台接入：适配器 [{key}] 已登记（uuid={uuid_val[:8]}…）")
+        except Exception as e:
+            logger.warning(f"多平台接入：适配器登记失败: {e}")
+
+    def multi_platform_namespace(self) -> bool:
+        """multi_platform.namespace 是否开启（默认 False=裸号，旧行为）。"""
+        try:
+            return bool((self.config.get('multi_platform') or {}).get('namespace', False))
+        except Exception:
+            return False
+
+    def adapter_plugin_allowed(self, plugin_name: str, adapter_key: str) -> bool:
+        """双向绑定判定：该适配器下的事件是否允许交给 plugin_name 处理。
+
+        判定（任一不满足即拒绝）：
+          - 适配器白名单（配置）：config[adapter_key].plugins 非空且 plugin_name 不在其中 → 拒绝；
+          - 插件声明适配的适配器：__plugin_meta__['adapters'] 非空且 adapter_key 不在其中 → 拒绝。
+        两者都为空（未配置）时视为「全部允许」。
+        """
+        # 1) 适配器白名单（config[adapter_key].plugins）
+        try:
+            whitelist = (self.config.get(adapter_key) or {}).get('plugins') or []
+        except Exception:
+            whitelist = []
+        if whitelist and plugin_name not in whitelist:
+            return False
+        # 2) 插件声明适配的适配器（插件 __plugin_meta__['adapters']）
+        #    必须走单插件 O(1) 查询：本方法在路由热路径上按「每消息 × 每插件」
+        #    调用，get_loaded_plugins() 会重建全量插件字典（O(插件数)），
+        #    叠加路由循环会退化成 O(插件数²)/消息。
+        #    另外 loader 的 meta 是白名单归一化结果（只留 name/version/…），
+        #    并不保留 adapters 这类自定义键，故直接读插件模块自身的声明。
+        try:
+            module = self.plugin_loader.get_plugin_module(plugin_name)
+            meta = getattr(module, '__plugin_meta__', None) or {}
+            padapters = meta.get('adapters') or []
+        except Exception:
+            padapters = []
+        if padapters and adapter_key not in padapters:
+            return False
+        return True
+
+    def _format_uptime(self):
+        """格式化运行时间"""
+        import time
+        seconds = time.time() - self._start_time if hasattr(self, '_start_time') else 0
+        days = int(seconds // 86400)
+        hours = int((seconds % 86400) // 3600)
+        mins = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        parts = []
+        if days > 0:
+            parts.append(f"{days}天")
+        if hours > 0:
+            parts.append(f"{hours}小时")
+        if mins > 0:
+            parts.append(f"{mins}分钟")
+        if secs > 0 or not parts:
+            parts.append(f"{secs}秒")
+        return "".join(parts)
+    @property
+    def api_caller(self):
+        return self.services.get('api_caller')
+    @property
+    def protocol_adapter(self):
+        """当前主协议接入端（services['protocol_adapter']）"""
+        primary = self.services.get('protocol_adapter')
+        return primary if primary is not None and hasattr(primary, 'get_connected_bots') else None
+    @property
+    def ws_server(self):
+        """兼容旧调用：优先取接入端自报的 ws_server，否则回落服务注册表"""
+        primary = self.services.get('protocol_adapter')
+        ws = getattr(primary, 'ws_server', None)
+        if ws is not None:
+            return ws
+        return self.services.get('ws_server')
+    @property
+    def scheduler(self):
+        return self.services.get('scheduler')
+    @property
+    def web_server(self):
+        return self.services.get('web_server')
+
+    def _migrate_legacy_data_dirs(self):
+        """
+        数据目录统一迁移：将旧版分散在项目根的 logs/、plugins_dat/ 迁移到 data/ 下。
+        仅当目标目录不存在时执行一次，避免覆盖新数据。
+        """
+        from framework.config import get_home
+        project_root = get_home()
+        data_dir = os.path.join(project_root, 'data')
+        os.makedirs(data_dir, exist_ok=True)
+
+        for old_name, new_name in (('logs', 'logs'), ('plugins_dat', 'plugins_dat')):
+            old_path = os.path.join(project_root, old_name)
+            new_path = os.path.join(data_dir, new_name)
+            if os.path.isdir(old_path) and not os.path.exists(new_path):
+                try:
+                    shutil.move(old_path, new_path)
+                    logger.info(f"数据目录迁移: {old_path} → {new_path}")
+                except Exception as e:
+                    logger.warning(f"数据目录迁移失败 [{old_name}]: {e}")
+
+    def _setup_logging(self):
+        """配置日志（统一存放于 data/logs/ 下）"""
+        from framework.config import get_home
+        project_root = get_home()
+        log_level = self.config.get('log', {}).get('level', 'INFO')
+
+        # 日志文件路径：优先配置 log.file，默认 data/logs/zcbot.log
+        log_file = self.config.get('log', {}).get('file') or os.path.join('data', 'logs', 'zcbot.log')
+        if not os.path.isabs(log_file):
+            log_file = os.path.join(project_root, log_file)
+        log_file = os.path.abspath(log_file)
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+        # 控制台日志
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(logging.Formatter(
+            '[%(asctime)s] %(levelname)s %(message)s',
+            datefmt='%H:%M:%S'
+        ))
+
+        # 文件日志（按大小轮转，保留历史，不手动删除旧日志）
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10MB
+            backupCount=5,
+            encoding='utf-8',
+            delay=True  # 延迟打开文件，避免初始化时文件锁问题
+        )
+        file_handler.setFormatter(logging.Formatter(
+            '[%(asctime)s] %(levelname)s [%(name)s] %(message)s'
+        ))
+
+        root = logging.getLogger()
+        root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+        root.addHandler(console)
+        root.addHandler(file_handler)
+
+        # 桥接框架日志到 LogBroker
+        root.addHandler(FrameworkLogHandler(log_broker))
+
+        # 结构化日志：log.format=json 时控制台与文件改为 JSON Lines。
+        # 桥接 handler 自带格式化，不会被替换（否则后台日志页会显示成 JSON 字符串）。
+        try:
+            from framework import jsonlog
+            _fmt = jsonlog.apply_format(self.config.get('log', {}).get('format', 'text'))
+            if _fmt == jsonlog.FORMAT_JSON:
+                logger.info("日志输出格式: JSON Lines（log.format=json）")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"日志格式设置失败，保持文本格式: {e}")
+
+        # 日志合并（自动止刷屏）：对归一化后相同的 WARNING+ 日志在滑动窗口内合并计数，
+        # 只发首条、窗口到期再发一条「该错误重复 N 次」汇总；INFO/DEBUG 不参与合并。
+        # 高并发下同一错误被每条消息/连接重复触发，不合并会直接刷爆日志文件与 WebUI。
+        log_cfg = self.config.get('log', {})
+        if log_cfg.get('coalesce', True):
+            from framework.coalesce_log import LogCoalescer
+            lvl_name = str(log_cfg.get('coalesce_level', 'WARNING')).upper()
+            lvl = getattr(logging, lvl_name, logging.WARNING)
+            coalescer = LogCoalescer(
+                window=float(log_cfg.get('coalesce_window', 10)),
+                min_level=lvl,
+            )
+            # 纳入框架生命周期：stop() 时统一停止后台 flush 线程
+            self._log_coalescers.append(coalescer)
+            # 挂在每个下游 handler 上（logging 的 logger.filter 不会作用于 ancestor，
+            # 只有 handler.filter 会对流经的每条记录生效）；同一 record 实例经多个 handler
+            # 时由合并器内部缓存决策，保证 console / 文件 / WebUI 三端一致。
+            for _h in root.handlers:
+                _h.addFilter(coalescer)
+            logger.info(
+                f"[日志] 已启用日志合并（窗口 {coalescer.window:.0f}s，级别 >= {lvl_name}）："
+                f"高并发重复错误将自动汇总，防止刷屏"
+            )
+
+        # 降低第三方库日志级别
+        logging.getLogger('apscheduler').setLevel(logging.WARNING)
+        logging.getLogger('websocket').setLevel(logging.WARNING)
+
+    def _get_plugins_dir(self) -> str:
+        """获取插件代码目录路径（优先使用配置；默认落在可写 home 下）"""
+        from framework.config import get_home
+        plugin_dir = self.config.get('plugin', {}).get('dir', '')
+        if plugin_dir:
+            if os.path.isabs(plugin_dir):
+                return plugin_dir
+            return os.path.join(get_home(), plugin_dir)
+        return os.path.join(get_home(), 'plugins')
+
+    def _get_core_plugins_dir(self) -> str:
+        """获取官方插件目录路径（core_plugins/，与 framework 同级）"""
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                            'core_plugins')
+
+    def _get_plugins_dat_dir(self) -> str:
+        """获取插件数据/配置目录路径（与 plugins 同级，统一存放于 data/ 下）"""
+        from framework.config import get_home
+        dat_dir = self.config.get('plugin', {}).get('dat_dir', '')
+        if dat_dir:
+            if os.path.isabs(dat_dir):
+                return dat_dir
+            return os.path.join(get_home(), dat_dir)
+        return os.path.join(get_home(), 'data', 'plugins_dat')
+
+    async def start(self, wait_ready: bool = True):
+        """启动框架（异步）
+
+        wait_ready=True ：等待核心/用户插件全部加载完成、路由表预热后才返回
+                         （默认，保持原同步启动行为）。
+        wait_ready=False：立即返回，不等待插件加载；核心/用户插件加载与路由
+                         预热在后台异步执行（事件队列/心跳/终端等基础服务
+                         已先就绪），可后续 await self.wait_ready(timeout=...)
+                         等待全部就绪。
+        """
+        self.loop = asyncio.get_running_loop()
+        self._running = True
+
+        logger.info("=" * 50)
+        logger.info(i18n.t('framework.starting'))
+        logger.info("=" * 50)
+
+        # 安全提示
+        self._warn_insecure_config()
+
+        # 1. 启动路由表周期刷新任务（首次预热在插件加载完成后进行）
+        self.router.start(self.loop)
+
+        # 2. 启动事件队列消费者。workers=1 → worker 直连事件缓冲（零额外开销）；
+        #    workers>1 → 按会话分片并行（同群/同用户事件保序、跨会话并行处理）
+        if self._event_workers_count > 1:
+            self._shard_queues = [
+                asyncio.Queue(maxsize=max(64, self._event_queue_maxsize))
+                for _ in range(self._event_workers_count)]
+            self._event_distributor_task = asyncio.create_task(
+                self._event_distributor_loop(), name="event-distributor")
+        for i in range(self._event_workers_count):
+            self._event_workers.append(
+                asyncio.create_task(
+                    self._event_worker_loop(i), name=f"event-worker-{i}")
+            )
+
+        # 2.5 启动 L4 写缓冲后台 flush 任务（事件溢出层批量落 L2 的驱动）
+        try:
+            self._event_buffer.start_l4(self.loop)
+        except Exception as e:
+            logger.warning(f"L4 写缓冲 flush 任务启动失败（事件溢出将直写 L2）: {e}")
+
+        # 3. 启动统计批量写库器
+        self.stats_writer.start()
+
+        # 4. 启动群成员同步批量写库任务
+        self._member_sync_task = asyncio.create_task(
+            self._member_sync_loop(), name="member-sync")
+
+        # 5. 启动心跳
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")
+
+        # 6. 启动内存看门狗
+        self._memory_watchdog_task = asyncio.create_task(
+            self._memory_watchdog_loop(), name="memory-watchdog"
+        )
+
+        # 7. 终端命令注册（核心/宿主两个进程都注册，命令绑定到本进程的 fw，供跨进程转发执行）；
+        #    交互输入只在非宿主进程启动（宿主子进程无交互 stdin，避免与核心抢控制台）
+        register_builtins(self)
+        if getattr(self, '_role', 'standard') != 'host':
+            self.terminal.start()
+        self.start_console_server()
+
+        # 8. 插件加载：wait_ready=True 同步等待（原行为）；False 后台异步执行不阻塞启动
+        if wait_ready:
+            loaded = await asyncio.to_thread(self._load_plugins_sync)
+            await self._finalize_startup(loaded)
+        else:
+            self._startup_load_task = asyncio.create_task(
+                self._background_startup_load(), name="startup-plugin-load")
+            logger.info(
+                "异步启动模式：插件加载已在后台执行，"
+                "可 await framework.wait_ready() 等待全部就绪")
+
+    def _load_plugins_sync(self) -> list:
+        """同步加载全部插件（core_plugins + 用户插件 + 依赖自愈 + register）。
+
+        独立成同步函数，供 start(wait_ready=False) 放入后台线程执行，
+        避免长时间 import/register 阻塞事件循环与启动返回。
+        """
+        import time
+        t0 = time.perf_counter()
+
+        # 1. 加载官方插件（core_plugins/）— 必须最先加载，提供基础服务
+        self._load_core_plugins()
+        t_core = time.perf_counter()
+
+        # 2. 确保 plugins_dat 目录存在
+        os.makedirs(self.plugin_loader.plugins_dat_dir, exist_ok=True)
+        self.plugin_loader.migrate_legacy_configs()
+
+        # 3. 加载用户插件（plugins/）
+        loaded = self.plugin_loader.load_all()
+        logger.info(f"已加载 {len(loaded)} 个用户插件: {loaded}")
+        t_user = time.perf_counter()
+
+        # 4. 插件依赖自愈
+        self._auto_heal_plugin_deps()
+        if hasattr(self.plugin_loader, '_missing_deps'):
+            with self.plugin_loader._lock:
+                healed_candidates = list(self.plugin_loader._missing_deps.keys())
+            for plugin_name in healed_candidates:
+                if plugin_name not in loaded and self.plugin_loader.is_plugin_active_in_db(plugin_name):
+                    if self.plugin_loader.load_plugin(plugin_name):
+                        loaded.append(plugin_name)
+            if loaded:
+                logger.info(f"自愈后共加载 {len(loaded)} 个插件: {loaded}")
+        t_heal = time.perf_counter()
+
+        # 5. 对每个已加载的插件执行 register
+        for plugin_name in loaded:
+            self.plugin_loader.register_commands(plugin_name)
+        t_reg = time.perf_counter()
+
+        logger.info(
+            f"插件加载耗时: core {t_core - t0:.2f}s / user {t_user - t_core:.2f}s "
+            f"/ 自愈 {t_heal - t_user:.2f}s / register {t_reg - t_heal:.2f}s / 合计 {t_reg - t0:.2f}s")
+        return loaded
+
+    async def _finalize_startup(self, loaded: list):
+        """插件加载完成后收尾：路由预热 + 系统事件 + 启动扩展点 + 置就绪标记"""
+        # 1. 路由表预热（重建热路径内存快照）
+        try:
+            await asyncio.to_thread(self.router._rebuild_routes)
+        except Exception as e:
+            logger.error(f"路由表预热失败: {e}")
+
+        # 2. 触发系统事件
+        await self.event_bus.aemit('system.plugin.loaded', {'plugins': loaded})
+
+        # 3. 触发启动扩展点（插件可在此预热/注册后台任务/挂载资源）
+        try:
+            await self.hooks.trigger_async(HookPoints.LIFECYCLE_STARTUP)
+        except Exception as e:
+            logger.error(f"启动扩展点异常: {e}", exc_info=True)
+
+        # 4. 就绪标记
+        self._ready = True
+        self._ready_event.set()
+        import time
+        logger.info(i18n.t('framework.started',
+                           elapsed="%.2f" % (time.time() - self._start_time)))
+
+    async def _background_startup_load(self):
+        """异步启动模式的后台插件加载任务"""
+        try:
+            loaded = await asyncio.to_thread(self._load_plugins_sync)
+            await self._finalize_startup(loaded)
+        except asyncio.CancelledError:
+            logger.warning("后台插件加载被取消（框架停机）")
+            raise
+        except Exception as e:
+            logger.error(f"后台插件加载异常: {e}", exc_info=True)
+            self._ready = False
+            self._ready_event.set()  # 唤醒 wait_ready，避免等待方永久挂起
+
+    async def wait_ready(self, timeout: float | None = None) -> bool:
+        """等待框架完全就绪（插件加载 + 路由预热完成）。
+
+        start(wait_ready=False) 后调用；timeout 为 None 时无限等待。
+        返回 True 表示就绪，False 表示超时或后台加载失败。
+        """
+        if self._ready:
+            return True
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return self._ready
+
+    async def terminal_exec(self, name: str, args: str = '') -> str:
+        """执行一条终端命令并捕获其输出（供双进程另一侧经 IPC 调用）。
+
+        终端命令 handler 用 print 输出；这里把 stdout 重定向后把文本回传，
+        让核心进程的终端能展示宿主侧命令（plugins / tasks 等）的真实结果。
+        """
+        import io
+        import contextlib
+        handler = terminal_commands.get(name)
+        if handler is None:
+            return f"未知命令: {name}"
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(args)
+                else:
+                    await asyncio.to_thread(handler, args)
+        except Exception as e:
+            return f"命令 [{name}] 执行失败: {e}"
+        out = buf.getvalue()
+        return out if out.strip() else f"[{name}] 已执行"
+
+    def start_console_server(self):
+        """启动本地调试控制台（端口 + 超长 token 自动生成并存入数据库）。
+
+        systemd 等无 TTY 场景下，本地执行 `python main.py attach` 即可接入，
+        无需重启。由 config.yaml 的 console 段控制（默认开启、仅回环地址）。
+        """
+        cfg = self.config.get('console', {}) or {}
+        if cfg.get('enabled', True) is False:
+            logger.info("调试控制台已禁用（console.enabled: false）")
+            return None
+        try:
+            from framework.console_server import ConsoleServer
+            self.console_server = ConsoleServer(
+                self,
+                host=str(cfg.get('host', '127.0.0.1') or '127.0.0.1'),
+                port=int(cfg.get('port', 0) or 0),
+                token_bits=int(cfg.get('token_bits', 16384) or 16384),
+                backlog=int(cfg.get('backlog', 8) or 8),
+                read_timeout=int(cfg.get('read_timeout', 3600) or 3600))
+            self.console_server.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"调试控制台启动异常: {e}")
+            self.console_server = None
+        return self.console_server
+
+    def build_ssl_context(self):
+        """构建服务端 SSLContext（Web HTTPS 与 OneBot WSS 共用 config['ssl']）。
+
+        cert/key 支持绝对路径或相对项目根目录（config.yaml 所在目录）。
+        未启用 ssl 时返回 None；已启用但证书缺失会抛异常（调用方负责降级/报错）。
+        """
+        from framework.tls import build_server_ssl_context
+        return build_server_ssl_context(
+            self.config.get('ssl', {}), os.path.dirname(self.config_path))
+
+    async def stop(self):
+        """停止框架（异步）"""
+        logger.info(i18n.t('framework.stopping'))
+        self._running = False
+
+        # 取消异步启动模式下仍在进行的后台插件加载任务
+        if self._startup_load_task:
+            self._startup_load_task.cancel()
+            try:
+                await self._startup_load_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._startup_load_task = None
+
+        # 触发关闭扩展点（插件可在此释放资源/落盘/断开外部连接）
+        try:
+            await self.hooks.trigger_async(HookPoints.LIFECYCLE_SHUTDOWN)
+        except Exception as e:
+            logger.warning(f"关闭扩展点异常: {e}")
+
+        # 停止终端交互
+        self.terminal.stop()
+        if getattr(self, 'console_server', None) is not None:
+            try:
+                self.console_server.stop()
+            except Exception:
+                pass
+            self.console_server = None
+
+        # 停止 L4 写缓冲后台任务并收尾 flush（先于事件缓冲排空，确保 L4 残留落 L2）
+        try:
+            await self._event_buffer.stop_l4()
+        except Exception as e:
+            logger.warning(f"L4 写缓冲停止异常: {e}")
+
+        # 停止事件缓冲消费者（限时排空三层缓冲，超时丢弃并取消 worker）。
+        # 分片模式下 wait_drained 的 join 语义已覆盖分片在途事件（worker 处理完
+        # 才 task_done），返回后分片队列必空，此时才取消分发器与 worker。
+        if self._event_workers:
+            if not await self._event_buffer.wait_drained(self._event_drain_timeout):
+                logger.warning(
+                    f"事件缓冲排空超时，丢弃剩余 "
+                    f"L1={self._event_buffer.stats()['l1_items']}条 "
+                    f"sqlite={self._event_buffer.sqlite_count()}条")
+            if self._event_distributor_task is not None:
+                self._event_distributor_task.cancel()
+            for w in self._event_workers:
+                w.cancel()
+            cancel_tasks = list(self._event_workers)
+            if self._event_distributor_task is not None:
+                cancel_tasks.append(self._event_distributor_task)
+            await asyncio.gather(*cancel_tasks, return_exceptions=True)
+            self._event_workers = []
+            self._event_distributor_task = None
+            self._shard_queues = None
+            self._event_buffer.close()
+
+        # 停止统计批量写库器
+        try:
+            await self.stats_writer.stop()
+        except Exception as e:
+            logger.warning(f"统计写库器停止异常: {e}")
+
+        # 停止群成员同步批量写库任务（最后一次 flush 收尾）
+        if self._member_sync_task:
+            self._member_sync_task.cancel()
+            try:
+                await self._member_sync_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._member_sync_task = None
+        try:
+            await asyncio.to_thread(self._flush_member_sync)
+        except Exception as e:
+            logger.warning(f"群成员同步收尾落库异常: {e}")
+
+        # 停止路由表刷新任务
+        try:
+            await self.router.stop()
+        except Exception as e:
+            logger.warning(f"路由表刷新任务停止异常: {e}")
+
+        # 停止插件心跳任务
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._heartbeat_task = None
+
+        # 停止内存看门狗
+        if self._memory_watchdog_task:
+            self._memory_watchdog_task.cancel()
+            try:
+                await self._memory_watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._memory_watchdog_task = None
+
+        # 停止官方插件（通过服务注册表；协议接入端优先，兼容旧 ws_server 键）
+        for name in ('protocol_adapter', 'ws_server', 'web_server', 'scheduler'):
+            svc = self.services.get(name)
+            if svc is not None:
+                try:
+                    if asyncio.iscoroutinefunction(svc.stop):
+                        await svc.stop()
+                    else:
+                        svc.stop()
+                except Exception as e:
+                    logger.warning(f"服务 [{name}] 停止异常: {e}")
+
+        # 关闭数据库专用线程池
+        try:
+            self._db_executor.shutdown(wait=False)
+        except Exception as e:
+            logger.warning(f"数据库线程池关闭异常: {e}")
+
+        # 触发系统事件
+        await self.event_bus.aemit('system.plugin.unloaded', {})
+
+        # 停止日志合并器后台 flush 线程（置信号 → 唤醒 → 有限等待退出；
+        # 合并决策不受影响，停止后仅缺少周期性兜底汇总）
+        for coalescer in getattr(self, '_log_coalescers', None) or []:
+            try:
+                coalescer.stop()
+            except Exception as e:
+                logger.warning(f"日志合并器停止异常: {e}")
+
+        logger.info(i18n.t('framework.stopped'))

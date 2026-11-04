@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import struct
 import time
@@ -197,10 +198,24 @@ class MCConsole:
         self._watchers = set()           # SSE 订阅者（asyncio.Queue）
         self._loop = None
         self._started = False
+        # 独立 mc_link 适配器启用时，TCP 链路与命令下发委托给它
+        self._link = None
         # Vue 工作流引擎：register() 中实例化并赋值（供 run_command / 消息钩子使用）
         self.workflow_engine = None
 
     # ================================================================ 生命周期
+    def _resolve_link(self):
+        """取独立 mc_link 适配器；未启用或异常一律回退内置 TCP 监听。"""
+        try:
+            fw = getattr(self.ctx, "_framework", None)
+            services = getattr(fw, "services", None) if fw is not None else None
+            link = services.get("mc_link") if services is not None else None
+            if link is not None and hasattr(link, "send_command"):
+                return link
+        except Exception:
+            pass
+        return None
+
     async def start(self):
         if self._started:
             return
@@ -210,9 +225,15 @@ class MCConsole:
         await self._init_workflow_perms()
 
         # 1) MC agent 协议 TCP 服务
-        tcp_server = await asyncio.start_server(
-            self._on_peer_connected, self.tcp_host, self.tcp_port, limit=TCP_BUF_SIZE)
-        self.ctx.log(f"MC TCP 协议监听 {self.tcp_host}:{self.tcp_port}")
+        #    优先委托给独立的 mc_link 适配器（非 HTTP，多适配器并存下按 source 订阅）。
+        #    未启用 mc_link 时保留内置监听，行为与旧版完全一致。
+        self._link = self._resolve_link()
+        if self._link is None:
+            tcp_server = await asyncio.start_server(
+                self._on_peer_connected, self.tcp_host, self.tcp_port, limit=TCP_BUF_SIZE)
+            self.ctx.log(f"MC TCP 协议监听 {self.tcp_host}:{self.tcp_port}")
+        else:
+            self.ctx.log("MC TCP 链路已委托 mc_link 独立适配器（跳过内置监听）")
 
         # 2) WebUI 控制台 HTTP 服务（自带 CORS，供框架内嵌 iframe / 直连）
         api_server = await asyncio.start_server(
@@ -472,6 +493,13 @@ class MCConsole:
         if user_id != 0 and not self.ctx.is_superuser(user_id) and user_id not in self.extra_admin_ids:
             return {"ok": False, "error": "permission-denied"}
 
+        if self._link is not None:
+            res = await self._link.send_command(command)
+            await self._audit_command(user_id, command, bool(res.get("ok")))
+            if res.get("ok"):
+                self._push_log(f"[admin:{user_id}] /{command}")
+            return res
+
         target = next((p for p in self._peers.values() if not p.offline), None)
         if target is None:
             await self._audit_command(user_id, command, False)
@@ -504,6 +532,8 @@ class MCConsole:
         instruction = (instruction or "").strip()
         if not instruction:
             return ""
+        if self._link is not None:
+            return await self._link.send_instruction(instruction, timeout)
         target = next((p for p in self._peers.values() if not p.offline), None)
         if target is None:
             self._push_log(f"[wf] MC 离线，指令未下发: {instruction}")
@@ -768,11 +798,36 @@ class MCConsole:
 
     # ================================================================ 暴露给 WebUI / 其它
     def status(self) -> dict:
+        if self._link is not None:
+            return self._link.status()
         return dict(self._status)
 
 
 # ------------------------------------------------------------------ ZCBOT 插件入口
 _console = None   # 模块级引用，供 on_unload 使用
+
+
+def _on_link_event(payload=None, *_):
+    """mc_link 广播的 notice 事件（source=mc_link，单独订阅）。
+
+    回填状态与日志，让现有 WebUI / SSE 在链路委托给独立适配器后仍能工作。
+    适配器未启用时不会收到任何事件，旧路径行为不变。
+    """
+    if _console is None or not isinstance(payload, dict):
+        return
+    kind = payload.get("notice_type")
+    if kind == "mc_heartbeat":
+        _console._status.update({
+            "online": True,
+            "tps": round(float(payload.get("tps") or 0), 2),
+            "players": int(payload.get("players") or 0),
+            "last_beat": int(time.time()),
+        })
+    elif kind == "mc_output":
+        for line in str(payload.get("text") or "").splitlines() or [""]:
+            _console._push_log(f"[mc-out] {line}")
+    elif kind == "mc_command":
+        _console._push_log(f"[MC] {payload.get('text', '')}")
 
 
 def _mcstatus_cmd(event, match):
@@ -792,6 +847,11 @@ def register(ctx):
     global _console
     _console = MCConsole(ctx)
     ctx._mc_console = _console  # 暴露给其它插件 / WebUI 扩展调用
+
+    # 独立适配器的帧事件：按事件名单独订阅，不碰 OneBot / Web 接入端的消息
+    ctx.on("notice.mc_heartbeat", _on_link_event)
+    ctx.on("notice.mc_output", _on_link_event)
+    ctx.on("notice.mc_command", _on_link_event)
 
     # 注入 WebUI 管理面板（静态资源走 plugins/minecraftconsole/web/）
     ctx.webui(title="MC控制台", entry="index.html", icon="🎮", order=10)
@@ -1076,14 +1136,32 @@ def _myplayers_cmd(event, match):
 
 
 def on_loaded(ctx):
-    """框架在 register 后调用一次（主事件循环内）：异步启动 TCP/HTTP 服务。"""
-    console = getattr(ctx, "_mc_console", None)
+    """框架在 register 后调用一次：异步启动 TCP/HTTP 服务。
+
+    新版框架在 asyncio.to_thread 工作线程里加载插件，这里拿不到
+    get_running_loop()，必须显式把 coroutine 派发回框架主循环。
+    """
+    console = getattr(ctx, "_mc_console", None) or _console
     if console is None:
         return
+    fw = getattr(ctx, "_framework", None)
+    loop = getattr(fw, "loop", None) if fw is not None else None
+    def _report(fut):
+        try:
+            fut.result()
+        except Exception as e:  # 跨线程 Future 的异常不会自动打印，必须主动取
+            logging.getLogger("zcbot").error(
+                f"[minecraftconsole] 异步服务启动失败: {type(e).__name__}: {e}",
+                exc_info=True)
+
     try:
-        asyncio.get_running_loop().create_task(console.start())
+        if loop is not None and loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(console.start(), loop)
+            fut.add_done_callback(_report)
+        else:
+            asyncio.get_running_loop().create_task(console.start())
     except RuntimeError as e:
-        ctx.log(f"[minecraftconsole] on_loaded 无法获取事件循环（将延迟启动）: {e}")
+        ctx.log(f"[minecraftconsole] on_loaded 无法派发启动任务: {e}")
 
 
 def on_unload():

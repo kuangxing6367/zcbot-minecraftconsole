@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+"""
+前端静态文件：css / js / img / HTML 页面 / 根路径与恢复页
+"""
+import logging
+import os
+
+from flask import Response, jsonify, redirect, send_from_directory
+
+logger = logging.getLogger('zcbot')
+
+
+def register(ctx):
+    app = ctx.app
+    framework = ctx.framework
+    _project_root = ctx._project_root
+
+    def _web_root_dir():
+        """前端根目录（框架默认 core_plugins/webui/web/ 目录，由 webui 插件构建产出）"""
+        return os.path.join(_project_root(), 'core_plugins', 'webui', 'web')
+
+    def _override_entry_url() -> str:
+        """
+        返回接管前端的插件入口 URL。
+        插件接管时根路径 / redirect 到该 URL，由插件路由服务其模板网页。
+        无接管返回 None。
+        """
+        name = framework.plugin_loader.get_override_webui()
+        if not name:
+            return None
+        return f'/{name}/'
+
+    @app.route('/css/<path:filename>')
+    def serve_css(filename):
+        return send_from_directory(os.path.join(_web_root_dir(), 'css'), filename)
+
+    @app.route('/js/<path:filename>')
+    def serve_js(filename):
+        return send_from_directory(os.path.join(_web_root_dir(), 'js'), filename)
+
+    @app.route('/img/<path:filename>')
+    def serve_img(filename):
+        return send_from_directory(os.path.join(_web_root_dir(), 'img'), filename)
+
+    @app.route('/favicon.ico')
+    def serve_favicon():
+        """站点图标（根路径，非 /img 下）"""
+        return send_from_directory(_web_root_dir(), 'favicon.ico')
+
+    @app.route('/robots.txt')
+    def serve_robots():
+        """爬虫协议：管理后台明确禁止收录"""
+        return Response('User-agent: *\nDisallow: /\n', mimetype='text/plain')
+
+    @app.route('/<page>.html')
+    def serve_page(page):
+        """提供 HTML 页面"""
+        web_static = _web_root_dir()
+        html_file = os.path.join(web_static, f'{page}.html')
+        if os.path.isfile(html_file):
+            return send_from_directory(web_static, f'{page}.html')
+        return jsonify({'code': 404, 'msg': '页面不存在'}), 404
+
+    @app.route('/')
+    def serve_index():
+        """根路径：若插件接管了前端则 redirect 到插件入口，否则返回框架默认 index.html
+
+        端口隔离模式（web.api_port 与 web.port 不同）下，真实 API 不在本端口提供，
+        需向首页注入 /webui-config.js，让前端知道去哪个端口调 API。
+        """
+        entry = _override_entry_url()
+        if entry:
+            return redirect(entry, code=302)
+
+        web_static = _web_root_dir()
+        if not getattr(ctx, 'api_split', False):
+            return send_from_directory(web_static, 'index.html')
+
+        # 需要注入配置脚本：读模板后在 </head> 前插入同源外部脚本（CSP 允许）
+        import os as _os
+        try:
+            with open(_os.path.join(web_static, 'index.html'), 'r', encoding='utf-8') as f:
+                html = f.read()
+        except Exception:
+            return send_from_directory(web_static, 'index.html')
+        if '__ZC_API_BASE__' not in html and '<script type="module"' in html:
+            html = html.replace('<script type="module"',
+                                '<script src="/webui-config.js"></script>\n  <script type="module"', 1)
+        return Response(html, mimetype='text/html')
+
+    @app.route('/reset')
+    def serve_reset():
+        """前端恢复页：若插件接管了前端则返回其 reset.html；
+        无接管页时回退框架默认 core_plugins/webui/web/reset.html（不存在则返回默认 index.html）。"""
+        web_static = _web_root_dir()
+        reset_file = os.path.join(web_static, 'reset.html')
+        if os.path.isfile(reset_file):
+            return send_from_directory(web_static, 'reset.html')
+        return send_from_directory(web_static, 'index.html')

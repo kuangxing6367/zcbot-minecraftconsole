@@ -1,0 +1,135 @@
+core_plugins:
+  aiwriter:
+    enabled: false
+    base_url: https://api.deepseek.com/v1
+    api_key: ''
+    model: deepseek-chat
+    temperature: 0.7
+    max_rounds: 12
+    timeout: 120
+    mode: workspace
+    allow_exec: false
+    workspace: ''
+    keep_turns: 20
+    max_history_chars: 24000
+    max_output: 8000
+    shell_timeout: 60
+    python_timeout: 60
+    net_timeout: 20
+    session_key: terminal
+    agent: build
+    agents: []
+  discord:
+    enabled: false
+    token: ''
+    bot_name: discord
+    intents: 37377
+    reconnect_interval: 5
+    api_base: https://discord.com/api/v10
+    gateway_url: wss://gateway.discord.gg/
+  html_assembler:
+    enabled: false
+    max_template_bytes: 4194304
+    max_image_bytes: 4194304
+    max_output_bytes: 16777216
+    max_images: 64
+    escape_html: true
+    on_missing: keep
+  http_api:
+    enabled: false
+    host: 127.0.0.1
+    port: 1145
+    token: ''
+    allow_db: false
+  http_inject:
+    enabled: false
+    host: 127.0.0.1
+    port: 8901
+    path: /hook
+    token: ''
+  image_renderer:
+    enabled: false
+  llm_load:
+    enabled: false
+    plugin_name: llm_core
+    auto_restart: true
+    payload: ''
+  mc_link:
+    enabled: false
+    host: 0.0.0.0
+    port: 25599
+    secret: ''
+    bot_name: mc_link
+  onebot_adapter:
+    enabled: false
+    listen_host: 0.0.0.0
+    listen_port: 6830
+    access_token: ''
+    max_pending_events: 4096
+    max_pending_bytes: 67108864
+    max_frame_size: 16777216
+  qq_official:
+    enabled: false
+    app_id: ''
+    app_secret: ''
+    bot_name: qq_official
+    intents: 100663296
+    reconnect_interval: 5
+    api_base: https://api.sgroup.qq.com
+    auto_ack_interaction: true
+    enable_notice_events: true
+  rust_accel:
+    enabled: false
+    ws_host: 0.0.0.0
+    ws_port: 6831
+    access_token: ''
+    max_frame_size: 16777216
+    max_pending_events: 4096
+    max_pending_bytes: 67108864
+    stats_interval_secs: 5
+    ipc_strip_raw: false
+    inherit_onebot: false
+    binary_path: ''
+    auto_build: false
+  scheduler:
+    enabled: false
+  session:
+    enabled: false
+  telegram:
+    enabled: false
+    token: ''
+    bot_name: telegram
+    polling_timeout: 30
+    api_base: https://api.telegram.org
+  webui:
+    enabled: true
+    host: 0.0.0.0
+    port: 8090
+  ws_client:
+    enabled: false
+    url: ws://127.0.0.1:9000/ws
+    bot_name: ws_client
+    token: ''
+    reconnect_interval: 5
+    max_queue: 256
+    reconnect_max_interval: 60
+    reconnect_jitter: 0.25
+  echo:
+    enabled: true
+  help:
+    enabled: true
+  kook:
+    enabled: false
+    token: ''
+    bot_name: kook
+    api_base: https://www.kookapp.cn
+    reconnect_interval: 5
+  matrix:
+    enabled: false
+    homeserver: ''
+    access_token: ''
+    user_id: ''
+    bot_name: matrix
+    sync_timeout: 30
+    rooms: []
+    reconnect_interval: 3

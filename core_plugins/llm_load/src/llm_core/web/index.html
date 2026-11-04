@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM 控制台</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #1c1f26;
+    --line: #2e333d;
+    --text: #d8dce3;
+    --muted: #8b93a1;
+    --accent: #6ea8fe;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 13px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  .tabs {
+    display: flex; gap: 4px; flex: none;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .tab {
+    background: none; border: 1px solid transparent; border-radius: 6px;
+    color: var(--muted); padding: 5px 14px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.on { color: var(--accent); border-color: var(--line); background: var(--bg); }
+  .views { flex: 1; position: relative; }
+  iframe {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    border: 0; background: var(--bg); display: none;
+  }
+  iframe.on { display: block; }
+</style>
+</head>
+<body>
+  <div class="tabs" id="tabs"></div>
+  <div class="views" id="views"></div>
+
+<script>
+const PAGES = [
+  { id: 'overview', label: '运行概览', entry: 'overview.html' },
+  { id: 'sessions', label: '会话管理', entry: 'sessions.html' },
+  { id: 'kb', label: '知识库', entry: 'kb.html' },
+  { id: 'trace', label: '调用链追踪', entry: 'trace.html' },
+]
+
+// 本页自己也是被 /api/plugin_webui/<插件名>?entry=index.html 发出来的，
+// 换 entry 只改查询串即可——不写死插件名，插件改名或换目录都不用动这里
+const SELF = location.pathname
+const tabs = document.getElementById('tabs')
+const views = document.getElementById('views')
+const frames = {}
+
+function show(id, remember) {
+  const page = PAGES.find(p => p.id === id) || PAGES[0]
+  let frame = frames[page.id]
+  if (!frame) {
+    frame = document.createElement('iframe')
+    frame.src = SELF + '?entry=' + encodeURIComponent(page.entry)
+    views.appendChild(frame)
+    frames[page.id] = frame
+  }
+  for (const key of Object.keys(frames)) frames[key].classList.toggle('on', key === page.id)
+  for (const btn of tabs.children) btn.classList.toggle('on', btn.dataset.id === page.id)
+  if (remember && location.hash !== '#' + page.id) history.replaceState(null, '', '#' + page.id)
+}
+
+for (const page of PAGES) {
+  const btn = document.createElement('button')
+  btn.className = 'tab'
+  btn.textContent = page.label
+  btn.dataset.id = page.id
+  btn.addEventListener('click', () => show(page.id, true))
+  tabs.appendChild(btn)
+}
+
+show((location.hash || '').slice(1), false)
+window.addEventListener('hashchange', () => show((location.hash || '').slice(1), false))
+</script>
+</body>
+</html>

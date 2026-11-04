@@ -1,8 +1,14 @@
 """
 OneBot 11 协议适配器（官方插件）
 将 OneBot WS 事件转换为框架内部格式，提供 API 调用能力
+
+本模块是 OneBot 协议专属实现，框架核心（framework/）不包含任何 OneBot 代码：
+- WebSocket 接入 / 连接管理 / API 调用通道都在本插件内；
+- 标准动作封装见同目录 onebot_api.py；
+- 通过 framework.messaging.protocol.ProtocolAdapter 抽象与 ServiceRegistry 接入框架。
 """
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -15,7 +21,8 @@ from urllib.parse import urlparse, parse_qs
 
 import websockets
 
-from framework.protocol import ProtocolAdapter
+from framework.core.event_buffer import EventBuffer
+from framework.messaging.protocol import ProtocolAdapter
 
 logger = logging.getLogger('zcbot')
 
@@ -26,16 +33,46 @@ __plugin_meta__ = {
     "desc": "OneBot 11 协议适配：WebSocket 连接 + API 调用",
     "priority": 0,
     "official": True,
+    # 双进程归属：协议接入基础设施，只在「核心进程」与单进程加载，宿主进程排除
+    "process": "core",
 }
+
+# 同目录加载标准动作封装（core 插件以合成模块名装载，不能用常规相对导入）
+def _load_sibling_onebot_api():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'onebot_api.py')
+    spec = importlib.util.spec_from_file_location(
+        'core_plugin_onebot_adapter_api', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.OneBotAPI
+
+
+OneBotAPI = _load_sibling_onebot_api()
 
 # websockets 版本兼容
 _WS_VERSION = tuple(int(p) for p in websockets.__version__.split('.')[:2])
 _WS_MAJOR = _WS_VERSION[0] if _WS_VERSION else 0
 
 _MAX_CONCURRENT_EVENTS = 64
-_MAX_PENDING_EVENTS = 256
+# 有序分发链的积压上限：进 EventBuffer 分层缓冲前的最后一道闸。可经
+# core_plugins.yaml → onebot.max_pending_events 覆盖（此处仅为缺省值）
+_MAX_PENDING_EVENTS = 4096
+# 分发层字节闸门：与条数闸门配套，防「条数未满但大事件（base64 图等）撑爆内存」。
+# onebot 原始 payload 单条可达数 MB，4096 条条数未到即可吃光内存。缺省 64MB 足够兜底
+# 瞬态积压（下游卡住时）又不会误伤正常小消息突发。可经 onebot.max_pending_bytes 覆盖。
+_MAX_PENDING_BYTES = 64 * 1024 * 1024
+# WS 单帧上限：websockets 库默认 1MiB，大报文（base64 图等）会以 1009 断链。
+# 可经 onebot.max_frame_size 覆盖（缺省 16MB）
+_DEFAULT_MAX_FRAME_SIZE = 16 * 1024 * 1024
 
 _SENT_ACTIONS = ('send_msg', 'send_group_msg', 'send_private_msg')
+
+# 是否记录发送到 OneBot11 的消息内容（register 时从框架配置填充，缺省 True）
+_log_sent_message = None
+
+
+def _should_log_sent_message() -> bool:
+    return True if _log_sent_message is None else _log_sent_message
 
 
 # ── 内部事件格式 ────────────────────────────────────────────────
@@ -46,6 +83,21 @@ def normalize_event(raw: dict, bot_name: str) -> Optional[dict]:
     if not post_type:
         return None
 
+    # 自身消息回显：NapCat / go-cqhttp / Lagrange 都能把机器人自己发出的消息
+    # 也上报上来（post_type=message_sent，或 message 且 user_id==self_id）。
+    # 不过滤会形成自激：机器人发的消息进管线 → 命中命令前缀 → 再发一条 → 无限循环。
+    # 这是社区里最常见的「机器人自己刷屏」成因，且在日志里看起来完全正常。
+    if post_type == 'message_sent':
+        logger.debug('[%s] 忽略自身消息回显 message_sent id=%s',
+                     bot_name, raw.get('message_id'))
+        return None
+    self_id = raw.get('self_id')
+    if (post_type == 'message' and self_id is not None
+            and str(raw.get('user_id')) == str(self_id)):
+        logger.debug('[%s] 忽略 self_id 发出的消息 id=%s',
+                     bot_name, raw.get('message_id'))
+        return None
+
     event = {
         'type': post_type,
         'sub_type': raw.get(f'{post_type}_type', ''),
@@ -54,12 +106,55 @@ def normalize_event(raw: dict, bot_name: str) -> Optional[dict]:
         'group_id': raw.get('group_id'),
         'message_id': raw.get('message_id'),
         'message': raw.get('message', ''),
-        'raw_message': raw.get('raw_message', ''),
         'sender': raw.get('sender', {}),
         'bot_name': bot_name,
         'adapter': 'onebot',
         'raw': raw,
     }
+    # 预算事件尺寸并随事件携带：入队热路径（EventBuffer._size_of）将直接 O(1) 取该值，
+    # 不再每条事件重复做浅层估算。算法与 framework.core.event_buffer.EventBuffer._size_of
+    # 的浅层回退逐字对齐（message 段 / sender / 顶层字段含 raw），保证带预存值与不预存两种
+    # 事件的水位判断一致；命中 1MB 重尾即截断，防超大事件拖慢预算本身。
+    # 注：onebot 归一化不再携带冗余的 raw_message（段数组 + 完整 raw 已包含全部信息），
+    # 故此处仅计 message / sender / 顶层字段；其他仍产出 raw_message 的适配器由 _size_of 回退计入。
+    _sz = 64  # 结构体固定开销
+    _msg = event.get('message')
+    if isinstance(_msg, (list, tuple)):
+        for _seg in _msg:
+            if isinstance(_seg, dict):
+                _d = _seg.get('data')
+                if isinstance(_d, dict):
+                    # 数 data 内所有字符串值（text/file/url……），抓 base64 大图重尾
+                    for _dv in _d.values():
+                        if isinstance(_dv, str):
+                            _sz += len(_dv)
+                        if _sz > (1 << 20):
+                            break
+                else:
+                    _sz += 24
+            else:
+                _sz += 24
+            if _sz > (1 << 20):
+                break
+    elif isinstance(_msg, str):
+        _sz += len(_msg)
+    elif isinstance(_msg, dict):
+        for _sv in _msg.values():
+            _sz += len(_sv) if isinstance(_sv, str) else 8
+    else:
+        _sz += 64
+    for _k, _v in event.items():
+        if _k in ('message', 'raw_message', '_est_size'):
+            continue
+        _sz += len(_k)
+        if isinstance(_v, str):
+            _sz += len(_v)
+        elif isinstance(_v, dict):
+            for _sv in _v.values():
+                _sz += len(_sv) if isinstance(_sv, str) else 8
+        else:
+            _sz += 8
+    event['_est_size'] = _sz
     return event
 
 
@@ -164,7 +259,6 @@ class BotConnection:
                 return {"status": "failed", "retcode": -1, "msg": "发送失败"}
 
             if action in _SENT_ACTIONS:
-                from framework.apis import _should_log_sent_message
                 if _should_log_sent_message():
                     msg = params.get('message', '')
                     target = f"群{params.get('group_id')}" if 'group_id' in params else f"私聊{params.get('user_id')}"
@@ -230,13 +324,17 @@ class ApiCaller:
         conn = self.get_connection(bot)
         if conn is None:
             return {"status": "failed", "retcode": -1, "msg": "无可用 OneBot 连接"}
-        return await conn.acall(action, **params)
+        from framework.messaging.outbound_guard import gate as _out_gate
+        return await _out_gate.execute_async(
+            action, bot, params, lambda: conn.acall(action, **params))
 
     def call(self, action: str, bot: str = None, **params) -> dict:
         conn = self.get_connection(bot)
         if conn is None:
             return {"status": "failed", "retcode": -1, "msg": "无可用 OneBot 连接"}
-        return conn.call(action, **params)
+        from framework.messaging.outbound_guard import gate as _out_gate
+        return _out_gate.execute_sync(
+            action, bot, params, lambda: conn.call(action, **params))
 
     def broadcast(self, action: str, **params) -> dict:
         return {n: c.call(action, **params) for n, c in self._connections.items()}
@@ -245,64 +343,27 @@ class ApiCaller:
         return self._connections
 
 
-# ── OneBot 11 API 封装 ───────────────────────────────────────
-
-class OneBotAPI:
-    """OneBot 11 标准 API 快捷方法"""
-
-    def __init__(self, api_caller: ApiCaller):
-        self._caller = api_caller
-
-    def __getattr__(self, action: str):
-        def _method(**kwargs):
-            bot = kwargs.pop('bot', None)
-            return self._caller.call(action, bot=bot, **kwargs)
-        return _method
-
-    async def acall(self, action: str, **kwargs):
-        bot = kwargs.pop('bot', None)
-        return await self._caller.acall(action, bot=bot, **kwargs)
-
-    def send_msg(self, user_id=None, group_id=None, message=None, auto_escape=False, bot=None):
-        if group_id:
-            return self._caller.call('send_group_msg', group_id=group_id, message=message,
-                                     auto_escape=auto_escape, bot=bot)
-        return self._caller.call('send_private_msg', user_id=user_id, message=message,
-                                 auto_escape=auto_escape, bot=bot)
-
-    def set_group_ban(self, group_id, user_id, duration=600, bot=None):
-        return self._caller.call('set_group_ban', group_id=group_id, user_id=user_id,
-                                 duration=duration, bot=bot)
-
-    def set_group_kick(self, group_id, user_id, reject_add_request=False, bot=None):
-        return self._caller.call('set_group_kick', group_id=group_id, user_id=user_id,
-                                 reject_add_request=reject_add_request, bot=bot)
-
-    def set_group_whole_ban(self, group_id, enable=True, bot=None):
-        return self._caller.call('set_group_whole_ban', group_id=group_id, enable=enable, bot=bot)
-
-    def set_group_card(self, group_id, user_id, card='', bot=None):
-        return self._caller.call('set_group_card', group_id=group_id, user_id=user_id,
-                                 card=card, bot=bot)
-
-    def get_group_member_list(self, group_id, bot=None):
-        return self._caller.call('get_group_member_list', group_id=group_id, bot=bot)
-
-    def get_group_member_info(self, group_id, user_id, bot=None):
-        return self._caller.call('get_group_member_info', group_id=group_id, user_id=user_id, bot=bot)
-
-
 # ── WebSocket 服务端 ──────────────────────────────────────────
 
 class OneBotWebSocketServer:
     """OneBot 11 反向 WebSocket 服务端（作为适配器的一部分）"""
 
-    def __init__(self, config: dict, on_event_callback, api_caller: ApiCaller):
+    def __init__(self, config: dict, on_event_callback, api_caller: ApiCaller,
+                 ssl_context=None):
         self.host = config.get('listen_host', '0.0.0.0')
         self.port = config.get('listen_port', 6830)
         self.access_token = config.get('access_token', '')
         self.on_event_callback = on_event_callback
         self.api_caller = api_caller
+        self._max_pending_events = max(
+            256, int(config.get('max_pending_events') or _MAX_PENDING_EVENTS))
+        self._max_pending_bytes = max(
+            1024 * 1024,
+            int(config.get('max_pending_bytes') or _MAX_PENDING_BYTES))
+        self.max_frame_size = max(
+            1024 * 1024, int(config.get('max_frame_size') or _DEFAULT_MAX_FRAME_SIZE))
+        # 启用 SSL 后 WebSocket 走 wss（与 Web 后台共用 config['ssl'] 证书）
+        self.ssl_context = ssl_context
 
         self._server = None
         self._server_task = None
@@ -313,6 +374,7 @@ class OneBotWebSocketServer:
         self._lock = threading.Lock()
         self._dispatch_semaphore = None
         self._dispatch_pending = 0
+        self._dispatch_pending_bytes = 0
         self._dispatch_dropped = 0
         self._conn_chains = {}
 
@@ -320,16 +382,32 @@ class OneBotWebSocketServer:
     def loop(self):
         return self._loop
 
-    def start(self):
+    def start(self, loop=None):
         if self._running:
             return
         self._running = True
-        self._loop = asyncio.get_running_loop()
-        self._dispatch_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_EVENTS)
-        self._server_task = asyncio.create_task(self._serve(), name="ws-server")
+        if loop is None:
+            loop = asyncio.get_running_loop()
+        self._loop = loop
+
+        def _boot():
+            # Semaphore/create_task 必须在事件循环线程上创建
+            self._dispatch_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_EVENTS)
+            self._server_task = asyncio.create_task(self._serve(), name="ws-server")
+
+        # 插件注册发生在工作线程（asyncio.to_thread），主循环运行在主线程，
+        # 必须把启动派发回事件循环线程执行
+        if loop.is_running():
+            loop.call_soon_threadsafe(_boot)
+        else:
+            _boot()
 
     async def _serve(self):
-        serve_kwargs = {'ping_interval': 30, 'ping_timeout': 10}
+        serve_kwargs = {'ping_interval': 30, 'ping_timeout': 10,
+                        'max_size': self.max_frame_size}
+        # 启用 SSL 时走 wss（websockets 原生支持 ssl= 参数）
+        if self.ssl_context is not None:
+            serve_kwargs['ssl'] = self.ssl_context
         if _WS_MAJOR >= 13:
             serve_kwargs['process_request'] = self._process_request_v13
         elif _WS_MAJOR >= 10:
@@ -342,7 +420,8 @@ class OneBotWebSocketServer:
             logger.error(f"WebSocket 服务启动失败: {e}")
             self._running = False
             return
-        logger.info(f"OneBot WebSocket 服务端已启动: ws://{self.host}:{self.port}")
+        scheme = 'wss' if self.ssl_context is not None else 'ws'
+        logger.info(f"OneBot WebSocket 服务端已启动: {scheme}://{self.host}:{self.port}")
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
@@ -410,15 +489,13 @@ class OneBotWebSocketServer:
                 post_type = data.get("post_type")
                 if post_type:
                     logger.debug(f"[{bot_name}] 收到事件 post_type={post_type} sub_type={data.get(f'{post_type}_type','')}")
-                    if self._dispatch_pending >= _MAX_PENDING_EVENTS:
-                        self._dispatch_dropped += 1
-                        logger.warning(f"[{bot_name}] 事件丢弃 pending={self._dispatch_pending} dropped={self._dispatch_dropped}")
+                    accepted, ev_size = self._try_enqueue_dispatch(bot_name, data)
+                    if not accepted:
                         continue
-                    self._dispatch_pending += 1
                     prev = self._conn_chains.get(bot_name)
                     task = asyncio.create_task(self._dispatch_ordered(prev, data, bot_name))
                     self._conn_chains[bot_name] = task
-                    task.add_done_callback(lambda t: setattr(self, '_dispatch_pending', self._dispatch_pending - 1))
+                    task.add_done_callback(lambda t: self._on_dispatch_done(ev_size))
                 else:
                     logger.debug(f"[{bot_name}] 收到无 post_type 的消息: {str(data)[:200]}")
 
@@ -435,6 +512,35 @@ class OneBotWebSocketServer:
             self._conn_chains.pop(bot_name, None)
             conn.set_ws(None)
             logger.info(f"[{bot_name}] OneBot 客户端已断开")
+
+    def _try_enqueue_dispatch(self, bot_name: str, data: dict):
+        """分发层闸门：条数 + 字节双限。返回 (accepted, ev_size)。
+
+        - 字节闸门类同条数闸门，防大事件（base64 图等）在「WS 收到 → 进 EventBuffer
+          前」的瞬态积压把内存吃爆（单条可达数 MB，4096 条文数未到已超百 MB）。
+        - ev_size 复用 EventBuffer._size_of：onebot 主来源事件已带 _est_size（O(1) 取值），
+          其它来源走浅层回退；纯估算成本可忽略。
+        - 该方法在事件循环线程执行，无并发竞争，记账直接增减。
+        """
+        ev_size = EventBuffer._size_of(data)
+        if (self._dispatch_pending >= self._max_pending_events
+                or self._dispatch_pending_bytes + ev_size > self._max_pending_bytes):
+            self._dispatch_dropped += 1
+            logger.warning(
+                f"[{bot_name}] 事件丢弃 pending={self._dispatch_pending} "
+                f"pending_bytes={self._dispatch_pending_bytes + ev_size} "
+                f"dropped={self._dispatch_dropped} "
+                f"(可调 onebot.max_pending_events/max_pending_bytes，"
+                f"当前 {self._max_pending_events}/{self._max_pending_bytes})")
+            return False, ev_size
+        self._dispatch_pending += 1
+        self._dispatch_pending_bytes += ev_size
+        return True, ev_size
+
+    def _on_dispatch_done(self, ev_size: int):
+        """分发完成回调：递减瞬态积压（条数 + 字节），事件循环线程执行，无并发竞争。"""
+        self._dispatch_pending -= 1
+        self._dispatch_pending_bytes -= ev_size
 
     async def _dispatch_ordered(self, prev, data: dict, bot_name: str):
         if prev is not None and not prev.done():
@@ -501,14 +607,66 @@ class OneBotWebSocketServer:
 class OneBotAdapter(ProtocolAdapter):
     """OneBot 11 协议适配器"""
 
+    adapter_id = 'onebot'
+
     def __init__(self, framework):
         self.framework = framework
         self.config = framework.config.get('onebot', {})
         self.api_caller = ApiCaller()
         self.api_caller.on_message_sent = self._on_message_sent
+        # SSL：与 Web 后台共用 config['ssl']；启用后反向 WS 走 wss
+        ssl_context = None
+        try:
+            ssl_context = framework.build_ssl_context()
+        except Exception as e:
+            logger.error(f"SSL 配置无效，OneBot 反向 WS 回退为 ws: {e}")
+        self.ssl_context = ssl_context
         self.ws_server = OneBotWebSocketServer(
-            self.config, self._on_raw_event, self.api_caller)
+            self.config, self._on_raw_event, self.api_caller, ssl_context=ssl_context)
         self._onebot_api = OneBotAPI(self.api_caller)
+
+    def get_connection_info(self) -> Optional[dict]:
+        """连接自描述：供 WebUI /api/connection 动态渲染（内核不写死 OneBot 字段）"""
+        host = self.config.get('listen_host', '0.0.0.0')
+        port = self.config.get('listen_port', 6830)
+        scheme = 'wss' if getattr(self, 'ssl_context', None) else 'ws'
+        return {
+            'id': 'onebot',
+            'name': 'OneBot 11 反向 WS',
+            'config_section': 'onebot',
+            'fields': [
+                {'key': 'listen_host', 'label': '监听地址', 'type': 'string'},
+                {'key': 'listen_port', 'label': '监听端口', 'type': 'number'},
+                {'key': 'access_token', 'label': 'Access Token', 'type': 'password'},
+                {'key': 'max_pending_events', 'label': '分发积压上限(条)', 'type': 'number'},
+                {'key': 'max_pending_bytes', 'label': '分发层字节上限(字节)', 'type': 'number'},
+                {'key': 'max_frame_size', 'label': 'WS 单帧上限(字节)', 'type': 'number'},
+            ],
+            'restart_keys': ['listen_host', 'listen_port', 'max_frame_size'],
+            'endpoint_hint': f"{scheme}://{host}:{port}/ws",
+            'guide': 'OneBot 客户端（NapCat / Lagrange / LLOneBot 等）添加「反向 WebSocket」连接，'
+                     '填写反向 WS 服务端地址即可接入。',
+            'status_extra': {'ws_port': port},
+        }
+
+    # ── 消息契约 ────────────────────────────────────────────────
+    # OneBot 的段数组本身就是规范形态的近亲（语音叫 record，由别名表归位），
+    # 所以入站/出站都直接用基类默认翻译器即可，这里只需要如实自述能力。
+
+    def capabilities(self):
+        from framework.messaging.contract import (
+            CAP_AT, CAP_FILE, CAP_FORWARD, CAP_GROUP_ADMIN, CAP_IMAGE,
+            CAP_JSON, CAP_NOTICE, CAP_RECALL, CAP_REPLY, CAP_REQUEST,
+            CAP_TEXT, CAP_VIDEO, CAP_VOICE, Capabilities,
+        )
+        return Capabilities(
+            inbound=[CAP_TEXT, CAP_IMAGE, CAP_VOICE, CAP_VIDEO, CAP_FILE,
+                     CAP_AT, CAP_REPLY, CAP_JSON, CAP_FORWARD,
+                     CAP_NOTICE, CAP_REQUEST],
+            outbound=[CAP_TEXT, CAP_IMAGE, CAP_VOICE, CAP_VIDEO, CAP_FILE,
+                      CAP_AT, CAP_REPLY, CAP_JSON, CAP_FORWARD],
+            actions=[CAP_RECALL, CAP_GROUP_ADMIN],
+        )
 
     async def handle_event(self, raw_event: dict, bot_name: str) -> Optional[dict]:
         return normalize_event(raw_event, bot_name)
@@ -516,11 +674,20 @@ class OneBotAdapter(ProtocolAdapter):
     async def call_api(self, action: str, bot: str = None, **params) -> dict:
         return await self.api_caller.acall(action, bot=bot, **params)
 
+    async def send_text(self, text: str, *, user_id=None, group_id=None,
+                        source: str = None) -> dict:
+        """协议中立文本发送：翻译成 OneBot 的群/私聊动作"""
+        if group_id:
+            return await self.api_caller.acall(
+                'send_group_msg', group_id=group_id, message=text, bot=source)
+        return await self.api_caller.acall(
+            'send_private_msg', user_id=user_id, message=text, bot=source)
+
     def get_connected_bots(self) -> list:
-        return self.ws_server.get_connected_bots()
+        return self.ws_server.get_connected_bots() if self.ws_server else []
 
     def start(self):
-        self.ws_server.start()
+        self.ws_server.start(getattr(self.framework, 'loop', None))
 
     async def stop(self):
         await self.ws_server.stop()
@@ -549,7 +716,7 @@ _adapter_instance = None
 
 def register(ctx):
     """注册 OneBot 适配器为官方插件"""
-    global _adapter_instance
+    global _adapter_instance, _log_sent_message
     fw = ctx._framework
 
     # 检查配置是否启用
@@ -557,6 +724,9 @@ def register(ctx):
     if onebot_cfg.get('enabled') is False:
         ctx.log("OneBot 适配器已禁用 (onebot.enabled: false)")
         return
+
+    # 日志开关：是否记录发送到 OneBot11 的消息内容
+    _log_sent_message = fw.config.get('log', {}).get('log_sent_message', True)
 
     _adapter_instance = OneBotAdapter(fw)
 
@@ -566,18 +736,27 @@ def register(ctx):
     fw.services.register('onebot_api', _adapter_instance._onebot_api)
     fw.services.register('ws_server', _adapter_instance.ws_server)
 
+    # OneBot 专属安全提示（框架核心不再假设具体协议，故由本适配器自行提示）
+    web_host = fw.config.get('web', {}).get('host', '0.0.0.0')
+    if web_host in ('0.0.0.0', '::') and not onebot_cfg.get('access_token', ''):
+        logger.warning(
+            "⚠ 安全提示: Web 面板监听 0.0.0.0 且 OneBot access_token 为空，"
+            "公网部署存在被接管风险。请设置 onebot.access_token，并将 web.host 改为 127.0.0.1。"
+        )
+
     # 启动 WebSocket 服务
     _adapter_instance.start()
 
-    ctx.log(f"OneBot 适配器已启动 (ws://{_adapter_instance.config.get('listen_host', '0.0.0.0')}:{_adapter_instance.config.get('listen_port', 6830)})")
+    _scheme = 'wss' if getattr(_adapter_instance, 'ssl_context', None) else 'ws'
+    ctx.log(f"OneBot 适配器已启动 ({_scheme}://{_adapter_instance.config.get('listen_host', '0.0.0.0')}:{_adapter_instance.config.get('listen_port', 6830)})")
 
 
 def unregister():
     """卸载时停止"""
     global _adapter_instance
     if _adapter_instance:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(_adapter_instance.stop())
+        inst = _adapter_instance
         _adapter_instance = None
+        loop = getattr(inst.framework, 'loop', None)
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(inst.stop(), loop)

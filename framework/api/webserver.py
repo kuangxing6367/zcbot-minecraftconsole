@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+"""
+Web UI 服务器（自 framework/api/webapp.py 剥离）
+在独立线程中运行 Flask 应用：waitress（HTTP）/ werkzeug（HTTPS）。
+"""
+import logging
+import threading
+from framework import i18n
+
+logger = logging.getLogger('zcbot')
+
+
+class WebServer:
+    """Web UI 服务器，在独立线程中运行"""
+
+    def __init__(self, framework):
+        from framework.api.webapp import create_web_app
+        self.framework = framework
+        self.app = create_web_app(framework)
+        web_cfg = framework.config.get('web', {})
+        self.host = web_cfg.get('host', '0.0.0.0')
+        self.port = web_cfg.get('port', 8080)
+        # 端口隔离：api_port 非空且不同 → 另起一个服务只跑 /api/*
+        # 两者同进程，共享黑名单 / 票据 / 会话状态（天然同步）
+        self.api_port = int(web_cfg.get('api_port', 0) or 0)
+        self.split_ports = bool(self.api_port) and self.api_port != self.port
+        # 纯 API 模式：ui_enabled=false → 不启动 WebUI 端口，仅起 API 监听
+        _ui_raw = web_cfg.get('ui_enabled', True)
+        if isinstance(_ui_raw, bool):
+            self.ui_enabled = _ui_raw
+        elif isinstance(_ui_raw, str):
+            self.ui_enabled = str(_ui_raw).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        else:
+            self.ui_enabled = bool(_ui_raw)
+        self.api_only = not self.ui_enabled
+        self.api_listen = self.api_port if self.api_port else self.port
+        # SSL：与 OneBot WSS 共用 config['ssl']；证书路径支持相对/绝对。
+        # waitress 不支持 TLS，故启用 SSL 时改用 werkzeug（支持 ssl_context）。
+        self.ssl_context = None
+        try:
+            self.ssl_context = framework.build_ssl_context()
+        except Exception as e:
+            logger.error(f"SSL 配置无效，Web 后台回退为 http: {e}")
+        self.scheme = 'https' if self.ssl_context else 'http'
+        self._thread = None
+        self._server = None
+        self._api_thread = None
+        self._api_server = None
+        self._running = False
+
+    def start(self):
+        """启动 Web 服务器"""
+        self._running = True
+        if self.api_only:
+            # 纯 API 模式：只起 API 监听，不启动 WebUI 前端端口
+            self._api_thread = threading.Thread(
+                target=self._run_api, daemon=True, name="api-server")
+            self._api_thread.start()
+            logger.info(f"[纯API模式] 仅 API 已启动: {self.scheme}://{self.host}:{self.api_listen}"
+                        f"（未启动 WebUI 前端）")
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name="web-server")
+        self._thread.start()
+        logger.info(i18n.t('webui.started',
+                           url=f"{self.scheme}://{self.host}:{self.port}"))
+        if self.split_ports:
+            self._api_thread = threading.Thread(
+                target=self._run_api, daemon=True, name="api-server")
+            self._api_thread.start()
+            logger.info(f"API 已独立监听: {self.scheme}://{self.host}:{self.api_port}"
+                        f"（WebUI 端口不再提供真实 API）")
+
+    def _run_api(self):
+        """API 端口的独立服务（与 WebUI 同进程，状态天然同步）"""
+        try:
+            from waitress.server import create_server as waitress_create_server
+            try:
+                self._api_server = waitress_create_server(
+                    self.app, host=self.host, port=self.api_listen, threads=8, ident='web')
+            except TypeError:
+                self._api_server = waitress_create_server(
+                    self.app, host=self.host, port=self.api_listen, threads=8)
+            self._api_server.run()
+        except Exception as e:
+            self._api_server = None
+            logger.error(f"[端口隔离] API 端口 {self.api_port} 启动失败: {e}")
+
+    def _run(self):
+        """运行 Web 服务器（保存 server 句柄，供 stop() 真正停止并释放端口）"""
+        # 指纹隐藏：Server 头统一为一个中性标识（留空则用 'web'，避免暴露 waitress/werkzeug）
+        # 生效值来自 security.level 档位解析（headers.enabled=false 时同样不暴露真实服务器名）
+        try:
+            from framework.api.security_levels import resolve as _resolve_security
+            _hdr = _resolve_security(self.framework.config.get('security'))['headers']
+            _ident = str(_hdr.get('server', '') or '') or 'web'
+        except Exception:
+            _ident = 'web'
+        try:
+            if self.ssl_context is not None:
+                # HTTPS：waitress 不支持 TLS，使用 werkzeug 的 ssl_context
+                from werkzeug.serving import make_server, WSGIRequestHandler
+
+                class _QuietHandler(WSGIRequestHandler):
+                    def version_string(self):
+                        return _ident
+
+                self._server = make_server(self.host, self.port, self.app,
+                                           threaded=True, ssl_context=self.ssl_context,
+                                           request_handler=_QuietHandler)
+                self._server.serve_forever()
+                return
+            try:
+                from waitress.server import create_server as waitress_create_server
+                try:
+                    self._server = waitress_create_server(
+                        self.app, host=self.host, port=self.port, threads=8, ident=_ident)
+                except TypeError:
+                    # 旧版 waitress 不支持 ident：回退为默认参数
+                    self._server = waitress_create_server(
+                        self.app, host=self.host, port=self.port, threads=8)
+                self._server.run()
+            except ImportError:
+                from werkzeug.serving import make_server, WSGIRequestHandler
+
+                class _QuietHandler(WSGIRequestHandler):
+                    def version_string(self):
+                        return _ident
+
+                self._server = make_server(self.host, self.port, self.app,
+                                           request_handler=_QuietHandler)
+                self._server.serve_forever()
+        except Exception as e:
+            self._server = None
+            if getattr(e, 'errno', None) == 98 or 'Address already in use' in str(e):
+                logger.error(
+                    f"Web UI 启动失败: 端口 {self.port} 已被占用。"
+                    f"可能残留了旧实例，请先停止旧进程（如: ss -tlnp | grep {self.port}）")
+            else:
+                logger.error(f"Web UI 异常: {e}")
+
+    def stop(self):
+        """停止 Web 服务器（真正关闭监听，避免优雅停机后端口残留）"""
+        self._running = False
+        srv = self._server
+        self._server = None
+        if srv is not None:
+            try:
+                if hasattr(srv, 'close'):
+                    srv.close()      # waitress WSGIServer
+                elif hasattr(srv, 'shutdown'):
+                    srv.shutdown()   # werkzeug
+            except Exception as e:
+                logger.warning(f"Web 服务器关闭异常: {e}")
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        self._thread = None
+
+        # 端口隔离：一并停掉 API 端口
+        if self.split_ports:
+            asrv = self._api_server
+            self._api_server = None
+            if asrv is not None:
+                try:
+                    if hasattr(asrv, 'close'):
+                        asrv.close()
+                    elif hasattr(asrv, 'shutdown'):
+                        asrv.shutdown()
+                except Exception as e:
+                    logger.warning(f"API 服务器关闭异常: {e}")
+            if self._api_thread and self._api_thread.is_alive():
+                self._api_thread.join(timeout=5)
+            self._api_thread = None
+        logger.info("Web UI 已停止")
+
+
+class WebServerStub:
+    """Web UI 假节点（占位实现，不创建真实 Flask 应用）
+
+    框架本体不依赖 flask：只有当启用 core_plugins/webui（web.enabled != false）
+    时才创建真实 WebServer；否则注册本假节点，保证服务注册表中
+    'web_server' 键恒非 None，调用方判空后即可安全使用，
+    且不会触发任何 flask 相关导入。
+    """
+
+    active = False
+
+    def __init__(self, framework):
+        self.framework = framework
+        self.app = None
+        web_cfg = framework.config.get('web', {})
+        self.host = web_cfg.get('host', '0.0.0.0')
+        self.port = web_cfg.get('port', 8080)
+        self._running = False
+
+    def start(self):
+        """假节点启动：仅记录日志，不监听端口"""
+        self._running = True
+        logger.info(
+            f"Web UI 假节点已注册（webui 未启用，不监听端口）: "
+            f"{self.host}:{self.port}")
+
+    def stop(self):
+        """假节点停止：仅记录日志"""
+        self._running = False
+        logger.info("Web UI 假节点已释放")

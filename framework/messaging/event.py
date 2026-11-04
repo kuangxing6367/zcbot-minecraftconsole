@@ -1,0 +1,619 @@
+"""
+Event 对象
+封装 OneBot 11 上报的事件数据，供插件 handler 使用
+"""
+import re
+import time
+from collections import OrderedDict
+
+from framework.messaging.segments import (
+    data_list, first as first_seg, is_media_only, media_ref, media_segments,
+    normalize_message, pick, segments_to_text,
+)
+from framework.messaging.adapter_registry import namespace_identity
+
+# 权限查询 TTL 缓存（热路径性能：避免每个事件反复查库）
+# 用户：user_id -> (role, is_blacklist, ts) ；群成员：(`group_id`,`user_id`) -> (role, ts)
+_ROLE_CACHE_TTL = 60.0
+# 角色缓存上限：超过后淘汰最久未使用条目，防止长期运行内存无限增长
+# （不活跃用户/群的条目永不刷新但一直驻留，属内存泄漏）
+_ROLE_CACHE_MAX = 5000
+# 用 OrderedDict 承载 LRU 顺序：命中 move_to_end(O(1))，溢出 popitem(last=False)(O(1))。
+# 旧实现每 256 次查询做一次 O(n) 全量重建，且条目全新鲜时压不下去（实际无界增长）；
+# 改为增量淘汰后无周期性抖动，内存严格有界。clear()/pop()/len() 等接口保持不变。
+_user_role_cache = OrderedDict()
+_group_role_cache = OrderedDict()
+_role_cache_checks = 0
+
+
+def invalidate_user_role_cache(user_id: int = None):
+    """清除用户权限缓存（Web 端修改权限后调用，None=全部）
+
+    多平台接入命名空间开启时，缓存键为 `<适配器uuid>@<id>` 字符串；
+    此处额外按 `@<id>` 后缀扫描清除，保证手动失效尽力覆盖。
+    """
+    if user_id is None:
+        _user_role_cache.clear()
+    else:
+        _user_role_cache.pop(user_id, None)
+        suf = '@' + str(user_id)
+        for k in [k for k in _user_role_cache
+                  if isinstance(k, str) and k.endswith(suf)]:
+            _user_role_cache.pop(k, None)
+
+
+def invalidate_group_role_cache(group_id: int = None, user_id: int = None):
+    """清除群成员权限缓存（多平台命名空间开启时键含适配器 uuid，尽力覆盖）"""
+    if group_id is None:
+        _group_role_cache.clear()
+    else:
+        g_suf = '@' + str(group_id)
+        u_suf = '@' + str(user_id) if user_id is not None else None
+        for k in list(_group_role_cache.keys()):
+            if not (isinstance(k, tuple) and len(k) == 2):
+                continue
+            gid_key, uid_key = k
+            if gid_key == group_id or (isinstance(gid_key, str) and gid_key.endswith(g_suf)):
+                if user_id is None or uid_key == user_id or (
+                        isinstance(uid_key, str) and u_suf is not None
+                        and uid_key.endswith(u_suf)):
+                    _group_role_cache.pop(k, None)
+
+
+def _extract_text(message):
+    """
+    从 OneBot 11 消息中提取纯文本
+    支持：字符串格式（CQ码）和数组格式（消息段）
+    - share 段（分享卡片）：提取 data.url 链接
+    - json 段（小程序/链接卡片）：正则提取其中的 http(s) 链接
+    """
+    if isinstance(message, str):
+        return message
+    if isinstance(message, list):
+        parts = []
+        for seg in message:
+            if isinstance(seg, dict):
+                seg_type = seg.get('type', '')
+                seg_data = seg.get('data', {})
+                if seg_type == 'text':
+                    parts.append(seg_data.get('text', ''))
+                elif seg_type == 'at':
+                    qq = seg_data.get('qq', '')
+                    parts.append(f'[@{qq}]')
+                elif seg_type == 'reply':
+                    pass  # 回复消息不提取
+                elif seg_type == 'share':
+                    url = seg_data.get('url', '')
+                    if url:
+                        parts.append(url)
+                elif seg_type == 'json':
+                    # 小程序/链接卡片：提取其中的 http(s) 链接
+                    raw = seg_data.get('data', '') or ''
+                    for m in re.finditer(r'https?://[^\s"\'<]+', raw):
+                        parts.append(m.group(0))
+                # 其他类型（image/face/record等）忽略
+        return ''.join(parts)
+    return str(message)
+
+
+def _has_text_segment(message) -> bool:
+    """
+    判断消息是否包含纯文本段（区别于从卡片/图片提取出的链接文本）
+    用于区分"文本消息"与"纯富媒体消息（分享卡片/图片等）"
+    """
+    if isinstance(message, str):
+        return bool(message)
+    if isinstance(message, list):
+        return any(
+            isinstance(s, dict) and s.get('type') == 'text'
+            and (s.get('data', {}) or {}).get('text', '')
+            for s in message
+        )
+    return bool(message)
+
+
+class Event:
+    """消息事件对象"""
+
+    def __init__(self, raw: dict, bot_name: str = 'default'):
+        self._raw = raw
+        self.bot_name = bot_name  # 消息来源的 OneBot 实例名
+
+        # 基础信息
+        self.post_type = raw.get('post_type', '')     # message / notice / request / meta_event
+        self.message_type = raw.get('message_type', '')  # group / private
+        self.sub_type = raw.get('sub_type', '')          # 子类型
+        self.self_id = raw.get('self_id', 0)             # 机器人用户 ID
+
+        # 消息内容（提取纯文本用于命令匹配）
+        # 热路径优化：dispatch 层已预提取文本并随事件携带时直接复用（_msg_text），
+        # 避免同一消息段数组被遍历两次；否则按原路径提取。
+        _raw_msg = raw.get('message', '')
+        if isinstance(raw.get('_msg_text'), str):
+            _msg_text = raw['_msg_text']
+        else:
+            _msg_text = _extract_text(_raw_msg)
+        self.message = _msg_text
+        # 群内被 @机器人 触发时，OneBot 会把 @ 段编码为 [@self_id] 前缀拼进文本，
+        # 导致命令前缀匹配（如 "@bot 查订单"）被污染成 "[@bot]查订单" 而失效。
+        # 此处仅从【匹配文本】剥离 leading [@self_id]，原始 segments 不动，
+        # 插件仍可通过 ev.has_at_bot / ev.at_list 读取艾特信息。
+        if isinstance(_raw_msg, list) and _raw_msg and \
+                _raw_msg[0].get('type') == 'at' and \
+                str(_raw_msg[0].get('data', {}).get('qq', '')) == str(self.self_id):
+            _bot_at_prefix = f'[@{self.self_id}]'
+            if self.message.startswith(_bot_at_prefix):
+                # 同时清掉 @ 后常见的尾随空格，避免 "查订单" 被前导空格挡住前缀匹配
+                self.message = self.message[len(_bot_at_prefix):].lstrip()
+        self.message_id = raw.get('message_id', 0)
+        # raw_message 缺省时复用 message 提取结果（避免同一消息段重复遍历提取）
+        _orig_raw = raw.get('raw_message')
+        self.raw_message = _msg_text if _orig_raw is None else _extract_text(_orig_raw)
+
+        # 消息段：一律归一为规范形态 [{'type':..., 'data':...}]
+        # 各协议对"语音"的叫法不同（OneBot=record / Telegram=voice+audio /
+        # QQ官方=独立 file_type），这里统一成 `voice`，插件按规范名读取即可。
+        raw_msg = raw.get('message', '')
+        seg_src = raw.get('segments') if isinstance(raw.get('segments'), list) \
+            else raw_msg
+        self.segments = normalize_message(seg_src)
+
+        # 接入端标识（telegram / discord / qq_official / onebot …）
+        self.adapter = raw.get('adapter', '') or ''
+
+        # 发送者信息
+        self.user_id = raw.get('user_id', 0)
+        self.sender = raw.get('sender', {}) or {}
+
+        # 群聊信息
+        self.group_id = raw.get('group_id', 0)
+
+        # 字体
+        self.font = raw.get('font', 0)
+
+        # ----- 权限信息（延迟加载，在调用属性时按需查询） -----
+        self._framework = None  # 由 router 注入
+        self._role_cache = None  # 缓存 role 查询结果
+        self._perm_cache = None  # 缓存权限组解析结果（PermissionSet）
+
+        # ----- 事件传播控制 -----
+        self._stopped = False  # 是否停止传播
+        self._continue_route = False  # 是否允许系统关键词回复继续尝试
+
+        # ----- 四类事件统一分类（架构设计「最终版」C 项） -----
+        # 单一真相源：消息事件进入管线时即具备 raw/all 维度，路由命中命令后回填
+        # general/regex（见 framework.messaging.router_match）。插件用 ev.category
+        # / ev.categories 读取，无需关心命令引擎/总线/raw 三套并存的内部差异。
+        self._category_command = None  # 路由命中后回填 'general' / 'regex'
+
+    # ===== 权限属性 =====
+
+    @property
+    def sender_role(self) -> str:
+        """OneBot 上报的 sender.role：owner / admin / member"""
+        return self.sender.get('role', 'member')
+
+    @property
+    def role(self) -> str:
+        """
+        完整身份等级：
+        super（超管）> owner（群主）> admin（管理员）> member（成员）> blacklist（黑名单）
+        首次查询后缓存结果，避免重复查库；底层权限查询带 60s TTL 内存缓存
+        """
+        if self._role_cache is not None:
+            return self._role_cache
+        if self._framework is None:
+            self._role_cache = self.sender_role
+            return self._role_cache
+        try:
+            db = self._framework.db
+            now = time.time()
+            uid = self.user_id
+
+            # 多平台接入：身份按适配器命名空间隔离（关闭时 ns_uid==uid，完全等价于旧行为）
+            fw = self._framework
+            _ns_enabled = bool(fw and getattr(fw, 'multi_platform_namespace', lambda: False)())
+            _reg = getattr(fw, 'adapter_registry', None) if fw else None
+            ns_uid = namespace_identity(_reg, self.adapter, _ns_enabled, uid)
+            ns_gid = namespace_identity(_reg, self.adapter, _ns_enabled, self.group_id)
+
+            # 惰性上限清理：每 256 次查询检查一次缓存规模，超限从 LRU 尾部（最久未用）淘汰。
+            # 只声明 _role_cache_checks 为 global：本函数不再重新绑定缓存字典本身，
+            # 仅调用其方法（popitem / move_to_end），故无需 global 缓存名。
+            global _role_cache_checks
+            _role_cache_checks += 1
+            if _role_cache_checks % 256 == 0:
+                # 增量淘汰：O(超额量)，且必然收敛（旧实现在条目全新鲜时压不下去）
+                while len(_user_role_cache) > _ROLE_CACHE_MAX:
+                    _user_role_cache.popitem(last=False)
+                while len(_group_role_cache) > _ROLE_CACHE_MAX:
+                    _group_role_cache.popitem(last=False)
+
+            # 用户级（super / blacklist）查询（60s TTL 内存缓存）
+            u_entry = _user_role_cache.get(ns_uid)
+            if u_entry is None or now - u_entry[2] > _ROLE_CACHE_TTL:
+                row = db.query_one(
+                    "SELECT role, is_blacklist FROM users WHERE user_id=%s", (ns_uid,))
+                if row:
+                    u_entry = (
+                        row.get('role') or '',
+                        1 if row.get('is_blacklist') else 0,
+                        now,
+                    )
+                else:
+                    u_entry = ('', 0, now)
+                _user_role_cache[ns_uid] = u_entry
+                _user_role_cache.move_to_end(ns_uid)
+            else:
+                # 命中：移到 LRU 尾部，避免活跃用户被误淘汰（O(1)）
+                _user_role_cache.move_to_end(ns_uid)
+            role, is_blacklist, _ = u_entry
+
+            if role == 'super':
+                self._role_cache = 'super'
+                return 'super'
+            if is_blacklist:
+                self._role_cache = 'blacklist'
+                return 'blacklist'
+
+            # 群内角色（TTL 缓存）
+            if self.is_group and self.group_id:
+                gkey = (ns_gid, ns_uid)
+                grp_cached = _group_role_cache.get(gkey)
+                if grp_cached is None or now - grp_cached[1] > _ROLE_CACHE_TTL:
+                    grp = db.query_one(
+                        "SELECT role FROM group_members WHERE group_id=%s AND user_id=%s",
+                        (ns_gid, ns_uid)
+                    )
+                    grole = (grp.get('role') or 'member') if grp else 'member'
+                    _group_role_cache[gkey] = (grole, now)
+                    _group_role_cache.move_to_end(gkey)
+                else:
+                    grole = grp_cached[0]
+                    _group_role_cache.move_to_end(gkey)
+                if grole in ('owner', 'admin'):
+                    self._role_cache = grole
+                    return grole
+            self._role_cache = 'member'
+            return 'member'
+        except Exception:
+            self._role_cache = self.sender_role
+            return self._role_cache
+
+    @property
+    def is_admin(self) -> bool:
+        """
+        判断用户是否具备管理权限（判断用户是否具备管理权限）
+        超管 / 群主 / 群管理员均返回 True
+        """
+        return self.role in ('super', 'owner', 'admin')
+
+    @property
+    def is_superuser(self) -> bool:
+        """判断用户是否为框架超级管理员"""
+        return self.role == 'super'
+
+    @property
+    def is_group_owner(self) -> bool:
+        """判断用户是否为群主"""
+        return self.role == 'owner'
+
+    @property
+    def is_group_admin(self) -> bool:
+        """判断用户是否为群管理员（不含群主，群主请用 is_group_owner）"""
+        return self.role == 'admin'
+
+    @property
+    def is_blacklisted(self) -> bool:
+        """判断用户是否在黑名单中（注意：超管即使被拉黑，role 仍为 super）"""
+        return self.role == 'blacklist'
+
+    # ===== 权限组（节点式，与 role 身份轴平行）=====
+    # 这一套完全独立于 Event.role：role 仍是单一字符串，权限组在其之外平行存在。
+    # 只有真正调用下面这些属性/方法时才会解析，普通消息零开销。
+
+    def _perm_set(self):
+        """获取（并缓存）完整权限快照"""
+        if self._perm_cache is not None:
+            return self._perm_cache
+        from framework import perm
+        try:
+            db = getattr(self._framework, 'db', None)
+            ctx = perm.context_from_event(self)
+            if db is None:
+                self._perm_cache = perm.PermissionSet(self.user_id, ctx, ['default'], {}, {})
+            else:
+                self._perm_cache = perm.resolve(db, self.user_id, ctx, self.role)
+        except Exception:
+            self._perm_cache = perm.PermissionSet(self.user_id, {}, ['default'], {}, {})
+        return self._perm_cache
+
+    def has_perm(self, node: str) -> bool:
+        """
+        判断是否拥有某个权限节点（未定义按拒绝处理）
+
+        :param node: 权限节点，如 'myplugin.ban'、'zcbot.role.admin'
+        支持通配符：'chat.*' 匹配 'chat.ban'；'*' 匹配一切
+        """
+        return self._perm_set().has(node)
+
+    def check_perm(self, node: str):
+        """
+        三态权限查询：True=授予 / False=显式否决 / None=未定义
+        """
+        return self._perm_set().check(node)
+
+    @property
+    def perms(self):
+        """完整权限快照对象（PermissionSet），可用 .groups / .nodes / .primary_group"""
+        return self._perm_set()
+
+    @property
+    def perm_groups(self) -> list:
+        """生效的权限组列表（含继承展开，按 weight 降序）"""
+        return list(self._perm_set().groups)
+
+    @property
+    def primary_group(self) -> str:
+        """权重最高的非内置权限组"""
+        return self._perm_set().primary_group
+
+    # ===== 事件传播控制 =====
+
+    def stop_event(self) -> None:
+        """
+        停止事件继续传播到后续插件。
+        停止事件传播
+        调用后，当前插件之后的插件将不再收到此事件。
+        """
+        self._stopped = True
+
+    def is_stopped(self) -> bool:
+        """
+        检查事件是否已被停止传播。
+        在 pipeline 的各阶段和 handler 循环中检查。
+        """
+        return self._stopped
+
+    def continue_route(self) -> None:
+        """
+        标记"本插件已处理，但允许系统关键词自动回复继续尝试"。
+        与 stop_event() 相对：插件命中命令后默认独占消息（关键词不再触发），
+        调用此方法可让系统关键词自动回复（dynamic_commands）仍继续尝试。
+        """
+        self._continue_route = True
+
+    def is_continue_route(self) -> bool:
+        """是否声明了继续路由（允许系统关键词回复继续尝试）"""
+        return self._continue_route
+
+    # ===== 富媒体辅助属性 =====
+
+    @property
+    def text(self) -> str:
+        """消息的纯文本（与 self.message 同义，命名更直白）"""
+        return self.message
+
+    @property
+    def media(self) -> list:
+        """全部内容型段（图片/语音/视频/文件/贴纸），元素为规范段"""
+        return media_segments(self.segments)
+
+    @property
+    def is_media_only(self) -> bool:
+        """是否"只有媒体没有文字"（纯图片/纯语音消息）"""
+        return is_media_only(self.segments)
+
+    @property
+    def has_image(self) -> bool:
+        """消息是否包含图片"""
+        return bool(pick(self.segments, 'image'))
+
+    @property
+    def has_reply(self) -> bool:
+        """消息是否包含回复"""
+        return bool(pick(self.segments, 'reply'))
+
+    @property
+    def has_voice(self) -> bool:
+        """消息是否包含语音（OneBot 的 record / 各家 audio 均归为此类）"""
+        return bool(pick(self.segments, 'voice'))
+
+    @property
+    def has_video(self) -> bool:
+        """消息是否包含视频"""
+        return bool(pick(self.segments, 'video'))
+
+    @property
+    def has_file(self) -> bool:
+        """消息是否包含文件"""
+        return bool(pick(self.segments, 'file'))
+
+    @property
+    def has_sticker(self) -> bool:
+        """消息是否包含贴纸（Telegram / Discord 有，QQ 系没有）"""
+        return bool(pick(self.segments, 'sticker'))
+
+    @property
+    def has_face(self) -> bool:
+        """消息是否包含表情"""
+        return bool(pick(self.segments, 'face'))
+
+    @property
+    def has_share(self) -> bool:
+        """消息是否包含分享卡片"""
+        return bool(pick(self.segments, 'share'))
+
+    @property
+    def share(self) -> dict:
+        """
+        获取分享卡片数据（title/url/desc 等）
+        没有分享卡片则返回空 dict
+        """
+        for s in self.segments:
+            if s.get('type') == 'share':
+                return s.get('data', {}) or {}
+        return {}
+
+    @property
+    def has_at(self) -> bool:
+        """消息是否包含 @ 提及"""
+        return any(s.get('type') == 'at' for s in self.segments)
+
+    @property
+    def has_at_bot(self) -> bool:
+        """消息是否 @ 了机器人（self_id）"""
+        return any(
+            s.get('type') == 'at' and str(s.get('data', {}).get('qq', '')) == str(self.self_id)
+            for s in self.segments
+        )
+
+    @property
+    def reply_id(self):
+        """
+        获取回复的消息 ID（如果消息是回复）
+        能转成 int 就返回 int；接入端用字符串 ID（如 QQ 官方）时返回原字符串。
+        没有回复则返回 None
+        """
+        data = first_seg(self.segments, 'reply')
+        raw_id = data.get('id')
+        if raw_id in (None, ''):
+            return None
+        try:
+            return int(raw_id)
+        except (ValueError, TypeError):
+            return str(raw_id)
+
+    @property
+    def images(self) -> list:
+        """
+        获取消息中所有图片信息
+        返回 [{file, url, file_id, ...}]，取决于接入端提供的数据；
+        取"文件引用"请用 image_ref（跨协议统一）。
+        """
+        return data_list(self.segments, 'image')
+
+    @property
+    def voices(self) -> list:
+        """获取消息中所有语音的 data（跨协议统一，OneBot 的 record 也在此列）"""
+        return data_list(self.segments, 'voice')
+
+    @property
+    def videos(self) -> list:
+        """获取消息中所有视频的 data"""
+        return data_list(self.segments, 'video')
+
+    @property
+    def files(self) -> list:
+        """获取消息中所有文件的 data（QQ/OneBot 的 file 段）"""
+        return data_list(self.segments, 'file')
+
+    @property
+    def stickers(self) -> list:
+        """获取消息中所有贴纸的 data（Telegram / Discord）"""
+        return data_list(self.segments, 'sticker')
+
+    @property
+    def first_image(self) -> dict:
+        """获取第一张图片的数据（没有返回空 dict）"""
+        imgs = self.images
+        return imgs[0] if imgs else {}
+
+    @property
+    def first_voice(self) -> dict:
+        """获取第一条语音的数据（没有返回空 dict）"""
+        got = self.voices
+        return got[0] if got else {}
+
+    @property
+    def first_video(self) -> dict:
+        """获取第一个视频的数据（没有返回空 dict）"""
+        got = self.videos
+        return got[0] if got else {}
+
+    @property
+    def first_file(self) -> dict:
+        """获取第一个文件的数据（没有返回空 dict）"""
+        got = self.files
+        return got[0] if got else {}
+
+    def media_url(self, segment: dict) -> str:
+        """
+        取某个内容型段的文件引用（URL / 本地路径 / file_id / base64://…）。
+
+        各协议把文件放在不同字段（OneBot `file`、Telegram `file_id`、
+        Discord `url`、QQ 官方 `file_info`），用本方法不用关心差异。
+        """
+        return media_ref(segment)
+
+    @property
+    def at_list(self) -> list:
+        """获取所有被 @ 的用户 ID 列表"""
+        result = []
+        for s in self.segments:
+            if s.get('type') == 'at':
+                qq = s.get('data', {}).get('qq', '')
+                if qq and qq != 'all':
+                    try:
+                        result.append(int(qq))
+                    except (ValueError, TypeError):
+                        pass
+        return result
+
+    @property
+    def at_all(self) -> bool:
+        """消息是否 @全体成员"""
+        return any(
+            s.get('type') == 'at' and s.get('data', {}).get('qq') == 'all'
+            for s in self.segments
+        )
+
+    @property
+    def is_group(self) -> bool:
+        return self.message_type == 'group'
+
+    @property
+    def is_private(self) -> bool:
+        return self.message_type == 'private'
+
+    # ===== 四类事件统一分类（架构设计「最终版」C 项） =====
+    @property
+    def category(self) -> str:
+        """本事件的最终分类（四类 + 非消息），单一取值。
+
+        - 非消息事件（meta/notice/request）→ 'none'
+        - 命中命令后 → 'general' / 'regex'
+        - 否则（过 raw + message 总线兜底）→ 'all'
+        - raw 是横切维度，始终可用（见 categories['is_raw']）
+        """
+        if self.post_type != 'message':
+            return 'none'
+        if self._category_command is not None:
+            return self._category_command
+        # 命令未命中：仍过 raw + message 总线兜底监听，归为全量
+        return 'all'
+
+    @property
+    def categories(self) -> dict:
+        """本事件的完整分类契约（四类标记，单一真相源）。
+
+        返回 {is_message, is_raw, is_all, command}；command 为 None/'general'/'regex'。
+        插件可在 message 类 handler 中据此判断消息属于哪一类。
+        """
+        return {
+            'is_message': self.post_type == 'message',
+            'is_raw': self.post_type == 'message',
+            'is_all': self.post_type == 'message',
+            'command': self._category_command,
+        }
+
+    @property
+    def sender_nickname(self) -> str:
+        return self.sender.get('nickname', '')
+
+    @property
+    def sender_card(self) -> str:
+        return self.sender.get('card', '')
+
+    def __repr__(self):
+        return f"Event(type={self.message_type}, user={self.user_id}, group={self.group_id}, msg={self.message[:30]})"

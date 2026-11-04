@@ -1,5 +1,5 @@
 -- ============================================================
--- OneBot 11 QQ机器人框架 · 数据库初始化脚本
+-- ZCBOT 事件驱动 IM 平台 · 数据库初始化脚本
 -- 目标数据库：MySQL 5.7
 -- 编码：utf8mb4
 -- ============================================================
@@ -12,11 +12,11 @@ USE zcbot;
 
 -- ============================================================
 -- 1. 用户表
--- 记录机器人已知的 QQ 用户信息
+-- 记录机器人已知的 平台用户信息
 -- ============================================================
 CREATE TABLE IF NOT EXISTS users (
     id              INT             AUTO_INCREMENT  PRIMARY KEY,
-    user_id         BIGINT          NOT NULL        COMMENT 'QQ号',
+    user_id         VARCHAR(64)          NOT NULL        COMMENT '用户 ID',
     nickname        VARCHAR(100)    DEFAULT NULL    COMMENT '昵称',
     avatar_url      VARCHAR(500)    DEFAULT NULL    COMMENT '头像URL',
     is_friend       TINYINT(1)      DEFAULT 0       COMMENT '是否为好友',
@@ -30,16 +30,16 @@ CREATE TABLE IF NOT EXISTS users (
     INDEX idx_blacklist (is_blacklist),
     INDEX idx_last_active (last_active_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  COMMENT='QQ用户信息表';
+  COMMENT='平台用户信息表';
 
 
 -- ============================================================
 -- 2. 群组表
--- 记录机器人加入的 QQ 群信息
+-- 记录机器人加入的 群组信息
 -- ============================================================
 CREATE TABLE IF NOT EXISTS groups_info (
     id              INT             AUTO_INCREMENT  PRIMARY KEY,
-    group_id        BIGINT          NOT NULL        COMMENT '群号',
+    group_id        VARCHAR(64)          NOT NULL        COMMENT '群号',
     group_name      VARCHAR(200)    DEFAULT NULL    COMMENT '群名称',
     member_count    INT             DEFAULT 0       COMMENT '成员数',
     max_member_count INT            DEFAULT 0       COMMENT '最大成员数',
@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS groups_info (
     INDEX idx_active (is_active),
     INDEX idx_blacklist (is_blacklist)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  COMMENT='QQ群信息表';
+  COMMENT='群组信息表';
 
 
 -- ============================================================
@@ -62,8 +62,8 @@ CREATE TABLE IF NOT EXISTS groups_info (
 -- ============================================================
 CREATE TABLE IF NOT EXISTS group_members (
     id              INT             AUTO_INCREMENT  PRIMARY KEY,
-    group_id        BIGINT          NOT NULL        COMMENT '群号',
-    user_id         BIGINT          NOT NULL        COMMENT 'QQ号',
+    group_id        VARCHAR(64)          NOT NULL        COMMENT '群号',
+    user_id         VARCHAR(64)          NOT NULL        COMMENT '用户 ID',
     card            VARCHAR(100)    DEFAULT NULL    COMMENT '群名片/昵称',
     role            VARCHAR(20)     DEFAULT 'member' COMMENT '角色：owner/admin/member',
     title           VARCHAR(100)    DEFAULT NULL    COMMENT '群头衔',
@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS commands (
     is_active       TINYINT(1)      DEFAULT 1       COMMENT '启用/禁用',
     hit_count       INT             DEFAULT 0       COMMENT '命中次数统计',
     created_at      DATETIME        DEFAULT CURRENT_TIMESTAMP    COMMENT '注册时间',
+    UNIQUE KEY uk_plugin_handler (plugin_name, handler),
     INDEX idx_plugin (plugin_name),
     INDEX idx_priority (priority),
     INDEX idx_active (is_active),
@@ -280,7 +281,7 @@ CREATE TABLE IF NOT EXISTS ip_blacklist (
 
 
 -- ============================================================
--- 权限组表（LuckPerms 风格权限系统）
+-- 权限组表（节点式权限系统）
 -- 模型：节点 node + 组 group + 继承(group.xxx 节点) + 上下文 context + 临时 expire_at + 否决 value=0
 -- 说明：
 --   1. 内置角色组（super/owner/admin/member）由框架代码虚拟注入，不入库，防止误删
@@ -304,7 +305,7 @@ CREATE TABLE IF NOT EXISTS perm_groups (
 
 -- ============================================================
 -- 权限组节点表
--- node = 'group.xxx' 表示该组继承 xxx 组（LuckPerms v5 做法：继承与权限统一用节点表达）
+-- node = 'group.xxx' 表示该组继承 xxx 组（继承与权限统一用节点表达）
 -- context_key / context_val 为 NULL 时表示该节点全局生效
 -- ============================================================
 CREATE TABLE IF NOT EXISTS perm_group_nodes (
@@ -329,7 +330,7 @@ CREATE TABLE IF NOT EXISTS perm_group_nodes (
 -- ============================================================
 CREATE TABLE IF NOT EXISTS perm_user_nodes (
     id              INT             AUTO_INCREMENT  PRIMARY KEY,
-    user_id         BIGINT          NOT NULL        COMMENT 'QQ号',
+    user_id         VARCHAR(64)          NOT NULL        COMMENT '用户 ID',
     node            VARCHAR(191)    NOT NULL        COMMENT '权限节点（group.xxx = 加入 xxx 组）',
     value           TINYINT(1)      DEFAULT 1       COMMENT '1=授予, 0=显式否决',
     context_key     VARCHAR(32)     DEFAULT NULL    COMMENT '上下文键: group/bot/msgtype，NULL=全局',
@@ -361,10 +362,10 @@ CREATE TABLE IF NOT EXISTS perm_tracks (
 -- ============================================================
 CREATE TABLE IF NOT EXISTS perm_audit (
     id              INT             AUTO_INCREMENT  PRIMARY KEY,
-    operator        VARCHAR(100)    DEFAULT NULL    COMMENT '操作者（Web账号 / QQ号 / system）',
+    operator        VARCHAR(100)    DEFAULT NULL    COMMENT '操作者（Web账号 / 用户 ID / system）',
     action          VARCHAR(32)     DEFAULT NULL    COMMENT '动作: set/unset/addgroup/removegroup/promote/demote/creategroup/deletegroup',
     target_type     VARCHAR(16)     DEFAULT NULL    COMMENT '目标类型: user/group/track',
-    target          VARCHAR(100)    DEFAULT NULL    COMMENT '目标标识（QQ号 / 组名 / 轨道名）',
+    target          VARCHAR(100)    DEFAULT NULL    COMMENT '目标标识（用户 ID / 组名 / 轨道名）',
     node            VARCHAR(191)    DEFAULT NULL    COMMENT '权限节点',
     value           TINYINT(1)      DEFAULT NULL    COMMENT '1=授予, 0=否决',
     context         VARCHAR(120)    DEFAULT NULL    COMMENT '上下文 key=val',
@@ -400,8 +401,8 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 INSERT IGNORE INTO perm_groups (name, display_name, weight, is_default, created_at)
     VALUES ('default', '默认组', 0, 1, UNIX_TIMESTAMP());
 
--- 默认管理员账号（密码需要在首次启动时强制修改）
--- 默认密码: admin123 （生产环境务必修改）
+-- 默认管理员账号（默认密码 admin123；WebUI 登录后会建议（非强制）用户修改，
+-- 后端通过比对下方哈希识别「仍使用默认密码」的账号，前端给出修改引导）
 INSERT INTO admin_users (username, password_hash, role) VALUES
     ('admin', '$2b$12$YsniVDvsFqQU0ENEUQNVhuVqpbr/e03SBWLSEcaUFkmeQzOaMujpq', 'super');
 
