@@ -1,0 +1,30 @@
+# 换行符统一为 LF。
+# 本机 core.autocrlf=true，checkout 会把文本转成 CRLF 再提交回去；
+# .sh 带 CRLF 到 Linux 直接 bad interpreter，.py 的 CRLF 也会污染 diff
+# （整文件增删、看不出真实改动）。这里逐类型钉死，不做全局 text=auto
+# 重规范化，避免历史文件一次性大改。
+*.sh      text eol=lf
+*.py      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.sql     text eol=lf
+*.json    text eol=lf
+*.toml    text eol=lf
+*.lock    text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.java    text eol=lf
+
+# 构建产物与二进制：不打换行转换，也不做文本 diff
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.gz      binary
+*.tar     binary
+*.jar     binary
+*.db      binary
+*.exe     binary
