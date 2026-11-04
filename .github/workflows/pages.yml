@@ -32,11 +32,11 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Build
         working-directory: site
-        run: npm run build
+        run: npm run docs:build
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: site/dist
+          path: site/.vitepress/dist
 
   deploy:
     needs: build

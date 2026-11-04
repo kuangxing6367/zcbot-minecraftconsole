@@ -1,0 +1,67 @@
+/* 冷峻极简暗色 + 克制的玻璃质感；沿用 VitePress 默认主题变量，只做局部微调 */
+:root {
+  --vp-c-brand-1: #7dd3fc;
+  --vp-c-brand-2: #a78bfa;
+  --vp-c-brand-3: #38bdf8;
+  --vp-c-brand-soft: rgba(125, 211, 252, 0.12);
+  --vp-font-family-base: "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --vp-font-family-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.dark {
+  --vp-c-bg: #0b1017;
+  --vp-c-bg-alt: #0e141d;
+  --vp-c-bg-soft: #111a25;
+}
+
+/* 首页：雾化远景 + 分层柔光 */
+.VPHero .container {
+  position: relative;
+}
+.VPHero .main {
+  letter-spacing: -0.02em;
+}
+.VPHero .name {
+  background: linear-gradient(110deg, #7dd3fc 0%, #c4b5fd 52%, #f0abfc 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.VPHero .tagline {
+  color: var(--vp-c-text-2);
+  letter-spacing: 0.01em;
+}
+
+/* 玻璃卡片 */
+.VPFeature, .custom-block {
+  border: 1px solid rgba(148, 163, 184, 0.14) !important;
+  background: rgba(17, 26, 37, 0.55) !important;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-radius: 14px !important;
+}
+.VPFeature:hover {
+  border-color: rgba(125, 211, 252, 0.35) !important;
+  transition: border-color 0.25s ease, transform 0.25s ease;
+  transform: translateY(-2px);
+}
+
+/* 代码块与表格：更收敛的边线 */
+.vp-doc div[class*="language-"] {
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 12px;
+}
+.vp-doc table {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.vp-doc h2 {
+  letter-spacing: -0.01em;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+  padding-top: 2.2rem;
+}
+
+/* 侧栏选中态 */
+.VPSidebarItem.is-active > .item > .link > .text {
+  color: var(--vp-c-brand-1);
+}
