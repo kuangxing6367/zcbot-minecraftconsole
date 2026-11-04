@@ -11,11 +11,15 @@ pip install -r requirements.txt
 python main.py                    # Linux 也可 bash start.sh
 ```
 
-登录面板：框架升级后 WebUI 默认端口为 **8090**（`core_plugins.yaml` 默认值）。默认账号 `admin / admin123`，上线前请改密码。
+登录面板：框架 Web 管理后台由 `config.yaml → web.port` 决定，默认 **8080**。业务插件接管了根路由，所以打开 `http://localhost:8080` 默认进入 MC 控制台壳页；框架原生 SPA 仍可用 `/index.html` 直达。默认账号 `admin / admin123`，上线前请改密码。
 
 ```text
-http://127.0.0.1:8090
+http://127.0.0.1:8080
 ```
+
+::: info 别把两个 Web 端口搞混
+新版框架另有 `core_plugins.yaml → webui.port: 8090`（默认启用），那是 **webui 核心插件**的独立服务，**不是** 8080 面板的新地址。两者并存，不是替代关系。
+:::
 
 ## 2. 构建 mc-agent
 
