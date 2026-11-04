@@ -24,14 +24,30 @@ jobs:
           java-version: "17"
           cache: maven
 
+      # 版本一致性：pom 的 <version> 与 plugin.yml 的 version 必须一致，
+      # 否则打出来的 jar 名字/插件页显示的版本各说各话（历史上 pom 停在
+      # 1.0.0 而 plugin.yml 已是 1.3.0，CI 才会找不到 mc-agent-*.jar）。
+      - name: Assert version consistency
+        shell: bash
+        run: |
+          pom_ver=$(sed -n 's#.*<version>\([0-9][^<]*\)</version>.*#\1#p' pom.xml | head -1)
+          yml_ver=$(sed -n 's#^version:[[:space:]]*\([^[:space:]]*\).*#\1#p' \
+                    src/main/resources/plugin.yml | head -1)
+          echo "pom=$pom_ver plugin.yml=$yml_ver"
+          if [ "$pom_ver" != "$yml_ver" ]; then
+            echo "::error::版本不一致：pom.xml=$pom_ver plugin.yml=$yml_ver"
+            exit 1
+          fi
+
       - name: Build
         run: mvn -B -ntp package -DskipTests
 
+      # finalName 固定为 mc-agent，jar 落在 target/mc-agent.jar
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
           name: mc-agent-jar
-          path: mc-agent-java/target/mc-agent-*.jar
+          path: mc-agent-java/target/mc-agent.jar
           if-no-files-found: error
 
   python:
