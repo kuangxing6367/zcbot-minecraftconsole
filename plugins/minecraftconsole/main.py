@@ -200,6 +200,8 @@ class MCConsole:
         self._started = False
         # 独立 mc_link 适配器启用时，TCP 链路与命令下发委托给它
         self._link = None
+        # zcore pass 签发者（v1 链路第三端）；start() 中实例化
+        self.pass_signer = None
         # Vue 工作流引擎：register() 中实例化并赋值（供 run_command / 消息钩子使用）
         self.workflow_engine = None
 
@@ -215,6 +217,17 @@ class MCConsole:
         except Exception:
             pass
         return None
+
+    def _pass_call(self, coro, timeout=5.0):
+        """命令 handler 跑在线程池，签发协程需派发回框架主循环执行。"""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return None
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
+        except Exception as e:
+            self.ctx.log(f"[zcore-pass] 操作失败: {e}")
+            return None
 
     async def start(self):
         if self._started:
@@ -234,6 +247,23 @@ class MCConsole:
             self.ctx.log(f"MC TCP 协议监听 {self.tcp_host}:{self.tcp_port}")
         else:
             self.ctx.log("MC TCP 链路已委托 mc_link 独立适配器（跳过内置监听）")
+
+        # 1.5) zcore pass 签发者（v1 链路第三端）
+        #      mc_link 只提供 zcore.pass.query 的 fail-closed 占位；真实闸门状态由本模块回答，
+        #      签发/吊销时调 bump_epoch 推进对账，控制器据此向 jar 侧推 zcore.pass.changed。
+        try:
+            import zcore_pass
+            _store = zcore_pass.PassStore(
+                os.path.join(self.ctx.get_data_dir(), "zcore_pass.json"))
+            self.pass_signer = zcore_pass.ZcorePassSigner(_store)
+            if self._link is not None:
+                self.pass_signer.attach(self._link)
+                self.ctx.log("zcore pass 签发者已接入 mc_link（zcore.pass.query）")
+            else:
+                self.ctx.log("未启用 mc_link，zcore pass 仅本地存储，不参与 RPC 对账")
+        except Exception as e:
+            self.pass_signer = None
+            self.ctx.log(f"zcore pass 签发者初始化失败（闸门保持 fail-closed）: {e}")
 
         # 2) WebUI 控制台 HTTP 服务（自带 CORS，供框架内嵌 iframe / 直连）
         api_server = await asyncio.start_server(
@@ -989,7 +1019,14 @@ def register(ctx):
                 description="解除本群的 MC 玩家绑定")
     ctx.command(r"^/?我的玩家\s*$", _myplayers_cmd, priority=40,
                 description="查看本群绑定的 MC 玩家")
-    ctx.log("[minecraftconsole] register 完成（WebUI + /mcstatus + 玩家绑定 + 工作流引擎已注册）")
+    # zcore pass 闸门管理（v1 链路第三端）：签发/吊销后自动推进对账 epoch
+    ctx.command(
+        r"^/?白名单(?:\s+(.+?))?\s*$", _pass_cmd,
+        priority=40, require_admin=True,
+        description="zcore 白名单闸门：/白名单 审批|拒绝|删除 <玩家> [小时]",
+        alias="/白名单",
+    )
+    ctx.log("[minecraftconsole] register 完成（WebUI + /mcstatus + 玩家绑定 + 工作流引擎 + zcore pass）")
 
 
 def _extract_message_text(raw_event) -> str:
@@ -1133,6 +1170,101 @@ def _myplayers_cmd(event, match):
     else:
         _safe_reply(ctx, event,
                     "你在本群尚未绑定 MC 玩家，发送 /绑定玩家 <游戏ID> 进行绑定")
+
+
+def _pass_cmd(event, match):
+    """/白名单：查询 / 审批 / 拒绝 / 删除 zcore pass（管理员）。
+
+    用法：
+        /白名单                 列出全部
+        /白名单 <玩家>          查询单个闸门状态
+        /白名单 审批 <玩家> [小时]   签发 approved（省略小时=不过期）
+        /白名单 拒绝 <玩家>      改为 rejected（吊销）
+        /白名单 删除 <玩家>      删除记录（回落到 default_action fail-closed）
+    """
+    if _console is None:
+        return
+    ctx = _console.ctx
+    signer = getattr(_console, "pass_signer", None)
+    if signer is None:
+        _safe_reply(ctx, event, "zcore pass 签发者未初始化，闸门保持 fail-closed")
+        return
+
+    arg = ""
+    if match is not None:
+        try:
+            arg = (match.group(1) or "").strip()
+        except (IndexError, AttributeError):
+            arg = ""
+    parts = arg.split()
+    op = parts[0] if parts else ""
+    rest = parts[1:]
+
+    try:
+        if not parts or op in ("列表", "list"):
+            rows = signer.list_passes()
+            if not rows:
+                _safe_reply(ctx, event, "暂无 pass 记录（未命中一律 fail-closed → pending）")
+                return
+            lines = ["玩家 | 状态 | 到期 | 签发人"]
+            for r in sorted(rows, key=lambda x: str(x.get("player"))):
+                exp = r.get("expires_at")
+                exp_txt = time.strftime("%m-%d %H:%M", time.localtime(exp)) if exp else "不过期"
+                lines.append(f"{r.get('player')} | {r.get('state')} | {exp_txt} | "
+                             f"{r.get('issued_by')}")
+            _safe_reply(ctx, event, "\n".join(lines))
+            return
+
+        if op in ("审批", "approve", "通过"):
+            if not rest:
+                _safe_reply(ctx, event, "用法：/白名单 审批 <玩家> [小时]")
+                return
+            player = rest[0]
+            ttl = None
+            if len(rest) >= 2 and rest[1].isdigit():
+                ttl = int(rest[1]) * 3600
+            rec = _console._pass_call(
+                signer.issue(player, "approved", issued_by=str(_ev_field(event, "user_id", 0)),
+                             ttl=ttl, note="chat-command"))
+            if rec is None:
+                _safe_reply(ctx, event, "签发失败，请稍后再试")
+                return
+            exp_txt = "不过期" if not rec.get("expires_at") else \
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["expires_at"]))
+            _safe_reply(ctx, event, f"已签发 pass：{player} → approved（到期：{exp_txt}）")
+            return
+
+        if op in ("拒绝", "吊销", "revoke", "deny"):
+            if not rest:
+                _safe_reply(ctx, event, "用法：/白名单 拒绝 <玩家>")
+                return
+            player = rest[0]
+            rec = _console._pass_call(
+                signer.revoke(player, issued_by=str(_ev_field(event, "user_id", 0))))
+            if rec is None:
+                _safe_reply(ctx, event, "操作失败，请稍后再试")
+                return
+            _safe_reply(ctx, event, f"已吊销 pass：{player} → rejected")
+            return
+
+        if op in ("删除", "delete"):
+            if not rest:
+                _safe_reply(ctx, event, "用法：/白名单 删除 <玩家>")
+                return
+            player = rest[0]
+            ok = _console._pass_call(signer.delete(player))
+            _safe_reply(ctx, event,
+                        f"已删除 {player} 的 pass 记录" if ok else f"没有 {player} 的记录")
+            return
+
+        # 兜底：把参数当玩家名查询
+        info = signer.store.query(arg)
+        _safe_reply(ctx, event,
+                    f"{arg}：state={info.get('state')} reason={info.get('reason')} "
+                    f"expires_at={info.get('expires_at')}")
+    except Exception as e:
+        ctx.log(f"[zcore-pass] 命令处理失败: {e}")
+        _safe_reply(ctx, event, "命令执行失败，请稍后再试")
 
 
 def on_loaded(ctx):
