@@ -23,6 +23,10 @@
 | `core_plugins/mc_link/rpc.py` | JSON-RPC 语义层 |
 | `core_plugins/mc_link/main.py` | 独立适配器主程序 |
 | `plugins/minecraftconsole/main.py` | 业务插件、WebUI、命令与工作流 |
+| `plugins/minecraftconsole/zcore_pass.py` | zcore pass 签发者（闸门第三端） |
 | `mc-agent-java/src/main/java/com/zgric/mcagent/` | Java 侧 FrameCodec / RpcHub / MiniJson / MCAgent |
 | `tests/test_mc_link.py` | 适配器单元测试 |
+| `tests/test_zcore_pass.py` | pass 签发者单元测试 |
+| `tests/interop/` | 跨语言互操作验证（golden frames + 真实 TCP） |
 | `.github/workflows/pages.yml` | 文档站 Pages 发布 |
+| `.github/workflows/release.yml` | mc-agent jar 打包发布到 GitHub Release |

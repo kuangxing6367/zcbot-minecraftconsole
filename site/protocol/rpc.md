@@ -177,11 +177,18 @@ Java agent (client, 奇数 id)                Python mc_link (server, 偶数 id)
 | 复杂度代价 | 三端需同步帧类型与能力位；老端永远看不懂新帧，只能靠兼容规则兜住 |
 | 时钟依赖 | `ts` 用秒级时间戳并要求两端时钟偏差在 3s 内，这是历史协议既有约束 |
 
-## 8. 尚未落地（明确边界）
+## 8. 落地情况与边界
 
-- **第三端**：白名单 / 验证码 / 自动与手动审批的 pass 签发者（zcore whitelist）尚未实现。当前只有适配器侧的 `zcore.pass.query` fail-closed 占位与 `register_method()` 注入口。
-- **Release 交付**：jar 由 CI artifact 产出（`target/mc-agent.jar`），自动发布到 GitHub Release 的工作流尚未配置。
-- **默认关闭**：`rpc-enabled` 与 `mc_link.enabled` 都为 `false`，要实际启用需部署配置与业务插件接入。
+已落地：
+
+- **第三端**：`plugins/minecraftconsole/zcore_pass.py` 是真实 pass 签发者，`start()` 里通过 `register_method("zcore.pass.query", ...)` 覆盖适配器占位；`issue/revoke/delete` 调 `bump_epoch` 推进对账，向 `CAP_PUSH` peer 推 `zcore.pass.changed`。聊天侧命令 `/白名单 审批|拒绝|删除|列表 <玩家>`（管理员）。
+- **互操作测试入库**：`tests/interop/`（`interop_server.py` + `InteropSmoke.java` + `run_interop.py`），CI 的 `protocol` job 每次都跑。
+- **Release 交付**：`.github/workflows/release.yml`，打 `mc-agent-v*` tag 时构建并把 `mc-agent-<ver>.jar` 挂到 GitHub Release。
+
+仍未落地 / 有意留白的部分：
+
+- **验证码与审批流**：`zcore_pass.py` 只做「状态存储 + 闸门应答 + 对账推进」，验证码下发、群内审批卡片、自动审批规则属于业务编排，未实现。
+- **默认关闭**：`rpc-enabled` 与 `mc_link.enabled` 都为 `false`，要实际启用需部署配置。
 - **UDP 心跳专线**：FRP UDP 心跳保持原有实现，与本文的 TCP BOOKMARK 是两条独立路径，不可混为一谈。
 
 ## 9. 验证
@@ -189,8 +196,9 @@ Java agent (client, 奇数 id)                Python mc_link (server, 偶数 id)
 | 层 | 位置 | 覆盖 |
 | --- | --- | --- |
 | Python 单元 | `tests/test_mc_link.py` | 历史帧字节一致、v1 扩展签名、能力闸门、未知帧跳过、RPC 幂等 / fail-closed / 410、真实 TCP 往返 |
+| 第三端单测 | `tests/test_zcore_pass.py` | fail-closed 默认值、签发 / 吊销 / 删除 / 过期语义、注入口覆盖、`bump_epoch` 载荷 |
 | Java 构建 | `mc-agent-java/pom.xml` | `mvn clean package` 产出 `target/mc-agent.jar` |
-| 跨语言互操作 | 会话工作区 `audit/InteropSmoke.java` + `audit/interop_server.py`（尚未入库） | Python golden frames 与 Java 逐字节比对、MiniJson 往返、fail-closed、BOOKMARK、live RESP id 关联 |
+| 跨语言互操作 | `tests/interop/`（`python tests/interop/run_interop.py`） | Python golden frames 与 Java 逐字节比对、MiniJson 往返、fail-closed、BOOKMARK、live RESP id 关联、`zcore.pass.query` 命中与未命中 |
 
 详见[跨语言互操作验证](/protocol/interop)。
 

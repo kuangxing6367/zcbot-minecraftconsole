@@ -32,6 +32,12 @@ mvn clean package
 
 ::: tip 交付形态
 jar 是**打包发布**产物，不入库：源码在 `mc-agent-java/src/main/java`，构建产物通过 CI artifact 或 Release 交付。不要手动把 jar 复制进仓库。
+
+正式发版打 tag 即可，`release.yml` 会构建并把 `mc-agent-<版本>.jar` 挂到 GitHub Release：
+
+```bash
+git tag mc-agent-v1.4.0 && git push origin mc-agent-v1.4.0
+```
 :::
 
 ## 3. 对接两端

@@ -36,6 +36,7 @@ export default defineConfig({
           { text: '组成与架构', link: '/guide/architecture' },
           { text: '快速开始', link: '/guide/getting-started' },
           { text: 'mc_link 适配器', link: '/guide/adapter' },
+          { text: 'zcore 白名单闸门', link: '/guide/zcore-pass' },
         ],
       },
       {

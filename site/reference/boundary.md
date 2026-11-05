@@ -27,6 +27,6 @@
 
 - **时钟**：帧 `ts` 是秒级时间戳，两端偏差超过 3s 会全部丢帧。
 - **secret 一致性**：两端 secret 不一致表现为「一直离线 + `bad-token`」，不是连不上。
-- **jar 交付**：`mvn clean package` 产出 `target/mc-agent.jar`，走 CI artifact / Release，不复制进仓库。
+- **jar 交付**：`mvn clean package` 产出 `target/mc-agent.jar`；打 `mc-agent-v*` tag 由 `release.yml` 自动挂到 GitHub Release，不复制进仓库。
 - **`port: 0`**：适配器把它当「随机端口」，是测试用的合法值，不会被兜底成 25599。
 - **UDP 心跳专线**：FRP UDP 心跳与 TCP BOOKMARK 是两条独立路径，不要互相替代。
