@@ -117,3 +117,7 @@ plugins/*/__pycache__/**
 
 # Java 构建产物
 mc-agent-java/target/
+
+# 跨语言互操作测试产物（golden.txt / port.txt / 编译后的 classes）
+tests/interop/.tmp/
+tests/interop/classes/

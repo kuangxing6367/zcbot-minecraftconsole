@@ -96,3 +96,40 @@ jobs:
             bash -n "$f" || { echo "::error file=$f::syntax error"; fail=1; }
           done < <(git ls-files '*.sh')
           exit $fail
+
+  protocol:
+    name: 协议单测 + 跨语言互操作
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyyaml flask
+
+      # mc_link 帧布局 / v1 扩展 / JSON-RPC 语义 / 真实 TCP 链路
+      - name: mc_link unit tests
+        run: python tests/test_mc_link.py
+
+      # 第三端签发者：fail-closed、签发/吊销/删除、bump_epoch 载荷
+      - name: zcore pass tests
+        run: python tests/test_zcore_pass.py
+
+      # Python golden 帧逐字节比对 + 真实 TCP RPC 往返（含 pass 查询）
+      # 脚本内部会在 target/classes 缺失时自行 mvn package
+      - name: Cross-language interop
+        run: python tests/interop/run_interop.py
