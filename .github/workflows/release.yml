@@ -1,0 +1,76 @@
+name: Release mc-agent
+
+# Java agent 按「打包发布」交付：源码在仓库，jar 不入库，
+# 由本工作流在打 tag 时构建并挂到 GitHub Release 资产上。
+#
+# 发版流程：
+#   git tag mc-agent-v1.4.0 && git push origin mc-agent-v1.4.0
+
+on:
+  push:
+    tags:
+      - "mc-agent-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 mc-agent-v1.4.0），需已存在于仓库"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish jar
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mc-agent-java
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Assert version consistency
+        shell: bash
+        run: |
+          pom_ver=$(sed -n 's#.*<version>\([0-9][^<]*\)</version>.*#\1#p' pom.xml | head -1)
+          yml_ver=$(sed -n 's#^version:[[:space:]]*\([^[:space:]]*\).*#\1#p' \
+                    src/main/resources/plugin.yml | head -1)
+          echo "pom=$pom_ver plugin.yml=$yml_ver"
+          if [ "$pom_ver" != "$yml_ver" ]; then
+            echo "::error::版本不一致：pom.xml=$pom_ver plugin.yml=$yml_ver"
+            exit 1
+          fi
+          echo "MC_AGENT_VERSION=$pom_ver" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: mvn -B -ntp clean package -DskipTests
+
+      - name: Rename asset
+        shell: bash
+        run: |
+          cp target/mc-agent.jar "target/mc-agent-${MC_AGENT_VERSION}.jar"
+          ls -l target/*.jar
+
+      - name: Publish release
+        shell: bash
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，仅覆盖资产"
+            gh release upload "$TAG" \
+              "mc-agent-java/target/mc-agent-${MC_AGENT_VERSION}.jar" --clobber
+          else
+            gh release create "$TAG" \
+              "mc-agent-java/target/mc-agent-${MC_AGENT_VERSION}.jar" \
+              --title "mc-agent ${MC_AGENT_VERSION}" \
+              --notes "Minecraft Console Java agent ${MC_AGENT_VERSION}（Bukkit 1.12.2 / Java 8 target）。源码在仓库，jar 为 CI 构建产物。"
+          fi
